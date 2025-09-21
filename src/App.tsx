@@ -8,13 +8,15 @@ import Editor, { useMonaco } from "@monaco-editor/react";
 // - Packs, Execute{ as/at/positioned }, if()/unless(), Run("...")
 // - GLOBAL VARS:
 //     * Strings -> storage <ns>:variables <Name>
-//     * Numbers -> scoreboard objective "vars", holder "_<ns>.<Name>"
+//     * Numbers -> scoreboard objective "vars", holder "_<ns>.<Name>" (+ kept in storage for macros)
 // - Numeric math: =, +=, -=, *=, /=, %=  (+ - * / % in expressions)
 // - if(num == 1) style conditions (==, !=, <, <=, >, >=)
 // - for-loops: for (var i = 0 | i < 10 | i++) { ... }  /  for (num | num < 10 | num++) { ... }
 // - adv / recipe blocks (pack-scope) to emit JSON helpers
-// - Global scoreboard bootstrap (__core__:__setup) added once to load
 // - Macro strings: Say($"...{x}...") and Run($"...{x}...")
+// - MACROS ONLY RESOLVE WHEN A FUNCTION IS CALLED WITH:
+//     function <ns>:<fn> with storage <ns>:variables
+//   (All calls + tag wrappers now include this.)
 // - Outputs (singular):
 //     data/<ns>/function/*.mcfunction
 //     data/<ns>/advancements/*.json
@@ -239,7 +241,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   function parseUnary(): Expr {
     const t = peek();
     if (t.type === "Minus") {
-      pos++; // consume '-'
+      pos++;
       const e = parseUnary();
       return { kind: "Binary", op: "-", left: { kind: "Number", value: 0, line: t.line, col: t.col }, right: e, line: t.line, col: t.col };
     }
@@ -501,7 +503,6 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
       if (low === "execute") return parseExecute();
       if (low === "if" || low === "unless") return parseIfUnless();
       if (low === "for") return parseFor();
-      // adv/recipe are pack-scope only; here only inside funcs.
       return parseAssignOrCallOrSayRun();
     }
     if (t.type === "RBrace") return null;
@@ -725,7 +726,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     const setup = [`data modify storage ${p.namespace}:system bootstrap set value 1b`];
     files.push({ path: `data/${p.namespace}/function/__setup.mcfunction`, contents: setup.join("\n") + "\n" });
 
-    // init globals
+    // init globals (+ mirror numbers into storage for macros)
     const types = packVarTypes[p.namespace];
     const init: string[] = [];
     for (const g of p.globals) {
@@ -738,11 +739,13 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           diagnostics.push({ severity: "Warning", message: `String init for '${g.name}' must be a static literal/concat; skipped`, line: g.line, col: g.col });
         }
       } else {
-        // number
+        // number: set scoreboard and store into storage
         let tmpIdx = { n: 0 };
         const tmpLines: string[] = [];
         const tmp = compileNumericExpr(g.init, (c) => tmpLines.push(c), tmpIdx, (n) => scoreName(p.namespace, n));
         tmpLines.push(`scoreboard players operation ${scoreName(p.namespace, g.name)} vars = ${tmp} vars`);
+        // mirror to storage so macros can read it
+        tmpLines.push(`execute store result storage ${p.namespace}:variables ${g.name} int 1 run scoreboard players get ${scoreName(p.namespace, g.name)} vars`);
         init.push(...tmpLines);
       }
     }
@@ -772,10 +775,13 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         const tmpIdx = { n: 0 };
         const tmpLines: string[] = [];
         const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePrefTo(chain)(c)), tmpIdx, resolveVar);
-        const target = `${resolveVar(assign.name)} vars`;
+        const targetHolder = resolveVar(assign.name);
+        const target = `${targetHolder} vars`;
         const opMap: Record<AssignStmt["op"], string> = { "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=" };
         sink.push(...tmpLines);
         withChainTo(sink, chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
+        // mirror to storage (works for locals and globals; locals overshadow globals temporarily)
+        withChainTo(sink, chain, `execute store result storage ${p.namespace}:variables ${assign.name} int 1 run scoreboard players get ${targetHolder} vars`);
       };
 
       const emitSay = (expr: Expr, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, sink: string[]) => {
@@ -859,7 +865,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         const localScores: Record<string, string> = {};
         const localTypes: Record<string, VarKind> = { ...envTypes };
 
-        // init
+        // init (set local scoreboard + mirror to storage)
         if (stmt.init && "kind" in stmt.init) {
           if ((stmt.init as any).kind === "VarDecl" && !(stmt.init as VarDeclStmt).isGlobal) {
             const d = stmt.init as VarDeclStmt;
@@ -870,12 +876,14 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             const tmp = compileNumericExpr(d.init, (c) => tmpLines.push(makePrefTo(chain)(c)), tmpIdx, (n) => localScores[n] ?? scoreName(p.namespace, n));
             sink.push(...tmpLines);
             withChainTo(sink, chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
+            // mirror to storage for macros
+            withChainTo(sink, chain, `execute store result storage ${p.namespace}:variables ${d.name} int 1 run scoreboard players get ${localScores[d.name]} vars`);
           } else if ((stmt.init as any).kind === "Assign") {
             emitAssign(stmt.init as AssignStmt, chain, localScores, localTypes, sink);
           }
         }
 
-        // entry: condition (if provided) -> step
+        // entry: condition -> step
         const entryLines: string[] = [];
         const prefix = (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
         const { lines: condLines, suffix } = condToExecuteSuffix(stmt.cond ?? null, chain, localScores);
@@ -910,7 +918,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             return;
 
           case "Run": {
-            // NEW: Macro support for Run($"...{x}...")
+            // Macro support for Run($"...{x}...")
             if (st.expr.kind === "MacroString") {
               const text = st.expr.raw.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => `$(${name})`);
               if (chain && chain.trim().length) sink.push(`$execute ${chain} run ${text}`);
@@ -930,8 +938,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             return;
 
           case "Call": {
-            const targetNs = st.targetPack ? st.targetPack.toLowerCase() : p.namespace;
-            withChainTo(sink, chain, `function ${targetNs}:${st.func.toLowerCase()}`);
+            const targetNs = (st.targetPack ? st.targetPack : p.namespace).toLowerCase();
+            withChainTo(sink, chain, `function ${targetNs}:${st.func.toLowerCase()} with storage ${targetNs}:variables`);
             return;
           }
 
@@ -986,6 +994,16 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       };
       files.push({ path: `data/${p.namespace}/recipes/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
     }
+
+    // Wrappers for Load/Tick so macros resolve (tags can't pass "with storage")
+    const hasLoad = p.functions.some(f => f.name.toLowerCase() === "load");
+    const hasTick = p.functions.some(f => f.name.toLowerCase() === "tick");
+    if (hasLoad) {
+      files.push({ path: `data/${p.namespace}/function/__wrap_load.mcfunction`, contents: `function ${p.namespace}:load with storage ${p.namespace}:variables\n` });
+    }
+    if (hasTick) {
+      files.push({ path: `data/${p.namespace}/function/__wrap_tick.mcfunction`, contents: `function ${p.namespace}:tick with storage ${p.namespace}:variables\n` });
+    }
   }
 
   // Tags (singular "function")
@@ -993,10 +1011,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
   const tickValues: string[] = [];
   for (const p of ast.packs) {
     loadValues.push(`${p.namespace}:__bootstrap`, `${p.namespace}:__init`);
-    for (const f of p.functions) {
-      if (f.name.toLowerCase() === "load") loadValues.push(`${p.namespace}:${f.name}`);
-      if (f.name.toLowerCase() === "tick") tickValues.push(`${p.namespace}:${f.name}`);
-    }
+    if (p.functions.some(f => f.name.toLowerCase() === "load")) loadValues.push(`${p.namespace}:__wrap_load`);
+    if (p.functions.some(f => f.name.toLowerCase() === "tick")) tickValues.push(`${p.namespace}:__wrap_tick`);
   }
   if (loadValues.length) files.push({ path: `data/minecraft/tags/function/load.json`, contents: JSON.stringify({ values: loadValues }, null, 2) + "\n" });
   if (tickValues.length) files.push({ path: `data/minecraft/tags/function/tick.json`, contents: JSON.stringify({ values: tickValues }, null, 2) + "\n" });
@@ -1026,8 +1042,7 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
       monaco.languages.setMonarchTokensProvider(id, {
         tokenizer: {
           root: [
-            // try to color macro strings as strings
-            [/\$\"[^\"]*\"/, "string"],
+            [/\$\"[^\"]*\"/, "string"], // macro string
             [/pack|namespace|func|global|var|let|Say|say|Execute|execute|if|unless|Run|run|for|adv|recipe|criterion|title|description|desc|icon|parent|type|ingredient|result/, "keyword"],
             [/\d+/, "number"],
             [/\"[^\"]*\"/, "string"],
@@ -1047,42 +1062,23 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
         const kw = ["pack", "namespace", "func", "global", "var", "let", "Say", "Execute", "if", "unless", "Run", "for", "adv", "recipe"];
         for (const k of kw) suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Keyword, insertText: k });
 
-        // snippets
         suggestions.push({
           label: "for loop (local)",
           kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `for (var i = 0 | i < 10 | i++){\n    Say("i=" + i)\n}\n`,
-          detail: "Local numeric loop"
-        });
-        suggestions.push({
-          label: "for loop (global)",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `for (num | num < 10 | num++){\n    Say("num=" + num)\n}\n`,
-          detail: "Loop over a global number"
+          insertText: `for (var i = 0 | i < 10 | i++){\n    Say($\"i={"{"}i{"}"}\")\n}\n`,
+          detail: "Local numeric loop with macro"
         });
         suggestions.push({
           label: "macro say",
           kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `Say($\"Hello {i}\")`,
+          insertText: `Say($\"Hello {"{"}i{"}"}\")`,
           detail: "Macro-interpolated Say"
         });
         suggestions.push({
           label: "macro run",
           kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `Run($\"tp @s ~ {i} ~\")`,
+          insertText: `Run($\"say loop index {"{"}i{"}"}\")`,
           detail: "Macro-interpolated Run"
-        });
-        suggestions.push({
-          label: "adv block",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `adv MyAdv(){\n    title "My Advancement";\n    description "Do the thing";\n    icon minecraft:stone;\n    // criterion name "minecraft:impossible"\n}\n`,
-          detail: "Advancement skeleton"
-        });
-        suggestions.push({
-          label: "recipe block (shapeless)",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `recipe MyRecipe{\n    type shapeless;\n    ingredient minecraft:stick;\n    ingredient minecraft:planks;\n    result minecraft:torch 4;\n}\n`,
-          detail: "Recipe skeleton"
         });
 
         // packs & symbols
@@ -1117,16 +1113,28 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
 
 // ---------- UI ----------
 const DEFAULT_SOURCE = `pack "Hello World" namespace hw{
+  global var msg = "Hello"
+  global var step = 1
+
   func Load(){
-    for (var i = 0 | i < 10 | i++){
-      Say(i)
-      Say($\"i is {i}\")
-      Run($\"say loop index {i}\")
-      Say("literal {i} (no macro)")
-    }
+    Say("Loaded")
   }
 
   func Tick(){
+    // local loop with macro output, increments mirrored to storage for macros
+    for (var i = 0 | i < 5 | i++){
+      Say($\"i={"{"}i{"}"} step={"{"}step{"}"}\")
+      Run($\"say macro says i is {"{"}i{"}"}\")
+    }
+
+    // cross-pack call example, always passes "with storage util:variables"
+    util.Ping()
+  }
+}
+
+pack "Utilities" namespace util{
+  func Ping(){
+    Say($\"[util] called at {"{"}step{"}"}\")
   }
 }
 `;
@@ -1203,14 +1211,14 @@ export default function WebDatapackCompiler() {
   const selectedFile = useMemo(() => compiled.files.find(f => f.path === selectedPath), [compiled.files, selectedPath]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-white to -slate-50 text-black">
+    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 text-black">
       <div className="mx-auto max-w-7xl p-6">
         <header className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <div className="h-9 w-9 rounded-xl bg-black/90 text-white grid place-items-center font-bold">DP</div>
             <div>
               <h1 className="text-xl font-bold">Datapack Web Compiler</h1>
-              <p className="text-xs text-black/60">Globals • Execute • for-loops • Macros in Say/Run • Adv/Recipes • IntelliSense • Zip export</p>
+              <p className="text-xs text-black/60">Globals • Execute • for-loops • Macros (with storage) • Adv/Recipes • IntelliSense • Zip export</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -1249,11 +1257,9 @@ export default function WebDatapackCompiler() {
             </div>
 
             <div className="text-xs text-black/60 mt-2 space-y-1">
+              <p><b>Macros:</b> automatically pass <code>with storage &lt;ns&gt;:variables</code> on function calls and tag wrappers. Use <code>$"..."</code> strings.</p>
               <p><b>for:</b> <code>for (var i = 0 | i &lt; 10 | i++)</code> or <code>for (num | num &lt; 10 | num++)</code></p>
-              <p><b>macro strings:</b> <code>Say($\"Hello {`{`}i{`}`}\")</code>, <code>Run($\"time set {`{`}i{`}`}\")</code></p>
-              <p><b>if:</b> <code>if(num == 1)</code> or raw <code>if("entity @s")</code></p>
-              <p><b>adv:</b> <code>adv Name() {'{'} title "X"; icon minecraft:stone; criterion got "minecraft:impossible"; {'}'}</code> (pack scope)</p>
-              <p><b>recipe:</b> <code>recipe Name {'{'} type shapeless; ingredient minecraft:stick; result minecraft:torch 4; {'}'}</code> (pack scope)</p>
+              <p><b>Say / Run (macro):</b> <code>Say($&quot;Hello {`{`}i{`}`}&quot;)</code>, <code>Run($&quot;say i={`{`}i{`}`}&quot;)</code></p>
             </div>
           </div>
         </div>
