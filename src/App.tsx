@@ -1,18 +1,19 @@
+// src/App.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
+import "./monaco-setup"; // if you wired Monaco workers manually (no plugin)
 import JSZip from "jszip";
 import Editor, { useMonaco } from "@monaco-editor/react";
-import './monaco-setup';
-
 
 // =============================
-// Multi-Pack Datapack Web Compiler
+// Multi-Pack Datapack Web Compiler (+ Execute/If/Unless/Run)
 // - Multiple `pack ... { }` blocks (class-like)
 // - Pack-scope variables (var/let)
-// - Functions per pack
-// - Cross-pack calls: `util.Ping()` or intra-pack `Ping()`
 // - Say("text" + Var)
-// - Simple IntelliSense via Monaco (keywords, pack names, functions, vars)
-// - Nicer UI
+// - Cross-pack calls: util.Ping() or intra-pack Ping()
+// - Execute(...) { ... } with as/at/positioned, plus nested if()/unless()
+// - Run("raw command")
+// - Monaco IntelliSense + Nicer UI
+// - OUTPUT PATH UPDATED: data/<ns>/function/<name>.mcfunction (singular)
 // =============================
 
 // ---------- Types ----------
@@ -31,7 +32,6 @@ type TokenType =
   | "EOF";
 
 type Token = { type: TokenType; value?: string; line: number; col: number };
-
 type Diagnostic = { severity: "Error" | "Warning" | "Info"; message: string; line: number; col: number };
 
 // Expressions
@@ -40,11 +40,21 @@ type VarExpr = { kind: "Var"; name: string; line: number; col: number };
 type ConcatExpr = { kind: "Concat"; left: Expr; right: Expr };
 type Expr = StringExpr | VarExpr | ConcatExpr;
 
+// Execute helpers
+type ExecMod =
+  | { kind: "as"; arg: string }
+  | { kind: "at"; arg: string }
+  | { kind: "positioned"; x: string; y: string; z: string };
+type ExecVariant = { mods: ExecMod[] };
+
 // Statements
 type SayStmt = { kind: "Say"; expr: Expr };
+type RunStmt = { kind: "Run"; expr: Expr };
 type VarDeclStmt = { kind: "VarDecl"; name: string; init: Expr; line: number; col: number };
 type CallStmt = { kind: "Call"; targetPack?: string; func: string; line: number; col: number };
-type Stmt = SayStmt | VarDeclStmt | CallStmt;
+type IfBlock = { kind: "If"; negated: boolean; cond?: Expr | null; body: Stmt[] };
+type ExecuteStmt = { kind: "Execute"; variants: ExecVariant[]; body: Stmt[] };
+type Stmt = SayStmt | VarDeclStmt | CallStmt | ExecuteStmt | IfBlock | RunStmt;
 
 // Decls
 type FuncDecl = { name: string; nameOriginal: string; body: Stmt[] };
@@ -53,7 +63,7 @@ type Script = { packs: PackDecl[] };
 
 type GeneratedFile = { path: string; contents: string };
 
-// Used in compile() signatures; define early to avoid any tooling complaints.
+// Symbol index for IntelliSense
 type SymbolIndex = { packs: Record<string, { title: string; vars: Set<string>; funcs: Set<string> }> };
 
 // ---------- Lexer ----------
@@ -72,7 +82,10 @@ function lex(input: string): Token[] {
     if (ch === " " || ch === "\t" || ch === "\r") { i++; col++; continue; }
 
     // line comments
-    if (ch === "/" && input[i + 1] === "/") { while (i < input.length && input[i] !== "\n") i++; continue; }
+    if (ch === "/" && input[i + 1] === "/") {
+      while (i < input.length && input[i] !== "\n") i++;
+      continue;
+    }
 
     // strings
     if (ch === "\"") {
@@ -93,9 +106,10 @@ function lex(input: string): Token[] {
       push({ type: "String", value: text, line: strLine, col: strCol }); i = j; continue;
     }
 
-    // identifiers
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i + 1; while (j < input.length && /[A-Za-z0-9_]/.test(input[j])) j++;
+    // identifiers (allow selectors/coords chars too)
+    if (/[A-Za-z_@~^0-9-]/.test(ch)) {
+      let j = i + 1;
+      while (j < input.length && /[A-Za-z0-9_@~^:-]/.test(input[j])) j++;
       const ident = input.slice(i, j);
       push({ type: "Identifier", value: ident, line, col }); col += (j - i); i = j; continue;
     }
@@ -139,13 +153,63 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     return { kind: "VarDecl", name, init, line: kw.line, col: kw.col };
   }
 
+  function parseIfUnless(): IfBlock {
+    const kw = expect("Identifier"); const neg = kw.value!.toLowerCase() === "unless";
+    if (!neg && kw.value!.toLowerCase() !== "if") throw { message: `Expected 'if' or 'unless'`, line: kw.line, col: kw.col };
+    expect("LParen");
+    let cond: Expr | null = null;
+    if (peek().type !== "RParen") cond = parseExpr();
+    expect("RParen");
+    expect("LBrace");
+    const body: Stmt[] = [];
+    while (peek().type !== "RBrace" && peek().type !== "EOF") { const s = parseStmt(); if (s) body.push(s); }
+    expect("RBrace");
+    return { kind: "If", negated: neg, cond, body };
+  }
+
+  function parseExecute(): ExecuteStmt {
+    const kw = expect("Identifier"); if (kw.value!.toLowerCase() !== "execute") throw { message: `Expected 'Execute'`, line: kw.line, col: kw.col };
+    expect("LParen");
+    const variants: ExecVariant[] = [];
+    let current: ExecVariant = { mods: [] };
+    const pushCurrent = () => { if (current.mods.length) { variants.push(current); current = { mods: [] }; } };
+
+    while (peek().type !== "RParen" && peek().type !== "EOF") {
+      const t = expect("Identifier");
+      const low = t.value!.toLowerCase();
+      if (low === "or") { pushCurrent(); if (peek().type === "Comma") match("Comma"); continue; }
+      if (low === "as") { const target = expect("Identifier").value!; current.mods.push({ kind: "as", arg: target }); }
+      else if (low === "at") { const target = expect("Identifier").value!; current.mods.push({ kind: "at", arg: target }); }
+      else if (low === "positioned") {
+        const x = expect("Identifier").value!; const y = expect("Identifier").value!; const z = expect("Identifier").value!;
+        current.mods.push({ kind: "positioned", x, y, z });
+      } else {
+        diags.push({ severity: "Error", message: `Unknown execute modifier '${t.value}'`, line: t.line, col: t.col });
+        while (peek().type !== "Comma" && !(peek().type === "Identifier" && peek().value === "or") && peek().type !== "RParen" && peek().type !== "EOF") pos++;
+      }
+      match("Comma");
+    }
+    expect("RParen");
+    pushCurrent();
+
+    expect("LBrace");
+    const body: Stmt[] = [];
+    while (peek().type !== "RBrace" && peek().type !== "EOF") { const s = parseStmt(); if (s) body.push(s); }
+    expect("RBrace");
+
+    if (!variants.length) variants.push({ mods: [] });
+    return { kind: "Execute", variants, body };
+  }
+
   function parseStmt(): Stmt | null {
     const t = peek();
     if (t.type === "Identifier") {
-      // Say(...)
-      if (t.value === "Say" || t.value === "say") { pos++; expect("LParen"); const expr = parseExpr(); expect("RParen"); match("Semicolon"); return { kind: "Say", expr }; }
-      // var/let
-      if (t.value === "var" || t.value === "let") { return parseVarDecl(); }
+      const low = t.value!.toLowerCase();
+      if (low === "execute") return parseExecute();
+      if (low === "if" || low === "unless") return parseIfUnless();
+      if (low === "run") { pos++; expect("LParen"); const expr = parseExpr(); expect("RParen"); match("Semicolon"); return { kind: "Run", expr }; }
+      if (low === "say") { pos++; expect("LParen"); const expr = parseExpr(); expect("RParen"); match("Semicolon"); return { kind: "Say", expr }; }
+      if (low === "var" || low === "let") { return parseVarDecl(); }
       // Calls: Pack.Func() or Func()
       const id1 = expect("Identifier").value!;
       if (match("Dot")) {
@@ -245,38 +309,83 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
   const files: GeneratedFile[] = [];
 
   const description = ast.packs[0]?.packTitle ?? "Datapack";
-  files.push({ path: `pack.mcmeta`, contents: JSON.stringify({ pack: { pack_format: PACK_FORMAT, description } }, null, 2) + "\n" });
+  files.push({
+    path: `pack.mcmeta`,
+    contents: JSON.stringify({ pack: { pack_format: PACK_FORMAT, description } }, null, 2) + "\n"
+  });
 
   const symbolIndex: SymbolIndex = { packs: {} };
   for (const p of ast.packs) {
     symbolIndex.packs[p.namespace] = { title: p.packTitle, vars: new Set(p.globals.map(g => g.name)), funcs: new Set(p.functions.map(f => f.name)) };
   }
 
-  for (const p of ast.packs) {
-    const env: Record<string, string> = {};
-    for (const g of p.globals) {
-      const v = evalExprString(g.init, env, diagnostics);
-      if (v !== undefined) env[g.name] = v;
-    }
+  // helper: emit statements with an optional execute chain prefix
+  function emitStmt(st: Stmt, chain: string, env: Record<string, string>, ns: string, out: string[]) {
+    const chainPrefix = chain ? `execute ${chain}` : "";
+    const run = (cmd: string) => {
+      if (chainPrefix) out.push(`${chainPrefix} run ${cmd}`);
+      else out.push(cmd);
+    };
 
-    for (const fn of p.functions) {
-      const out: string[] = [];
-      for (const st of fn.body) {
-        if (st.kind === "VarDecl") {
-          diagnostics.push({ severity: "Warning", message: `Local variables are not emitted; only pack-scope vars are supported for now.`, line: st.line, col: st.col });
-        } else if (st.kind === "Say") {
-          const text = evalExprString(st.expr, env, diagnostics);
-          if (text !== undefined) out.push(`say ${text}`);
-        } else if (st.kind === "Call") {
-          const targetNs = st.targetPack ? st.targetPack.toLowerCase() : p.namespace;
-          const funcName = st.func.toLowerCase();
-          out.push(`function ${targetNs}:${funcName}`);
-        }
+    switch (st.kind) {
+      case "VarDecl":
+        diagnostics.push({ severity: "Warning", message: `Local variables are not emitted; only pack-scope vars are supported for now.`, line: st.line, col: st.col });
+        break;
+      case "Say": {
+        const text = evalExprString(st.expr, env, diagnostics);
+        if (text !== undefined) run(`say ${text}`);
+        break;
       }
-      files.push({ path: `data/${p.namespace}/function/${fn.name}.mcfunction`, contents: out.join("\n") + (out.length ? "\n" : "") });
+      case "Run": {
+        const raw = evalExprString(st.expr, env, diagnostics);
+        if (raw !== undefined) run(raw);
+        break;
+      }
+      case "Call": {
+        const targetNs = st.targetPack ? st.targetPack.toLowerCase() : ns;
+        const funcName = st.func.toLowerCase();
+        run(`function ${targetNs}:${funcName}`);
+        break;
+      }
+      case "If": {
+        const condStr = st.cond ? evalExprString(st.cond, env, diagnostics) : undefined;
+        const add = condStr ? `${st.negated ? "unless" : "if"} ${condStr}` : "";
+        for (const inner of st.body) emitStmt(inner, [chain, add].filter(Boolean).join(" "), env, ns, out);
+        break;
+      }
+      case "Execute": {
+        if (!st.variants.length) { for (const inner of st.body) emitStmt(inner, chain, env, ns, out); break; }
+        for (const v of st.variants) {
+          const parts: string[] = [];
+          for (const m of v.mods) {
+            if (m.kind === "as") parts.push(`as ${m.arg}`);
+            else if (m.kind === "at") parts.push(`at ${m.arg}`);
+            else if (m.kind === "positioned") parts.push(`positioned ${m.x} ${m.y} ${m.z}`);
+          }
+          const nextChain = [chain, parts.join(" ")].filter(Boolean).join(" ");
+          for (const inner of st.body) emitStmt(inner, nextChain, env, ns, out);
+        }
+        break;
+      }
     }
   }
 
+  for (const p of ast.packs) {
+    const env: Record<string, string> = {};
+    for (const g of p.globals) { const v = evalExprString(g.init, env, diagnostics); if (v !== undefined) env[g.name] = v; }
+
+    for (const fn of p.functions) {
+      const outLines: string[] = [];
+      for (const st of fn.body) emitStmt(st, "", env, p.namespace, outLines);
+      // >>>>>>> singular "function" per your structure
+      files.push({
+        path: `data/${p.namespace}/function/${fn.name}.mcfunction`,
+        contents: outLines.join("\n") + (outLines.length ? "\n" : "")
+      });
+    }
+  }
+
+  // Standard tag paths (unchanged unless you tell me otherwise)
   const loadValues: string[] = []; const tickValues: string[] = [];
   for (const p of ast.packs) {
     for (const f of p.functions) {
@@ -284,8 +393,14 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       if (f.name.toLowerCase() === "tick") tickValues.push(`${p.namespace}:${f.name}`);
     }
   }
-  if (loadValues.length) files.push({ path: `data/minecraft/tags/function/load.json`, contents: JSON.stringify({ values: loadValues }, null, 2) + "\n" });
-  if (tickValues.length) files.push({ path: `data/minecraft/tags/function/tick.json`, contents: JSON.stringify({ values: tickValues }, null, 2) + "\n" });
+  if (loadValues.length) files.push({
+    path: `data/minecraft/tags/function/load.json`,
+    contents: JSON.stringify({ values: loadValues }, null, 2) + "\n"
+  });
+  if (tickValues.length) files.push({
+    path: `data/minecraft/tags/function/tick.json`,
+    contents: JSON.stringify({ values: tickValues }, null, 2) + "\n"
+  });
 
   return { files, diagnostics, symbolIndex };
 }
@@ -312,9 +427,9 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
       monaco.languages.setMonarchTokensProvider(id, {
         tokenizer: {
           root: [
-            [/pack|namespace|func|var|let|Say|say/, "keyword"],
+            [/pack|namespace|func|var|let|Say|say|Execute|execute|if|unless|Run|run/, "keyword"],
             [/\"[^\"]*\"/, "string"],
-            [/[a-zA-Z_][a-zA-Z0-9_]*/, "identifier"],
+            [/[a-zA-Z_@~^0-9-][a-zA-Z0-9_@~^:-]*/, "identifier"],
             [/[{()}.;=+]/, "delimiter"],
           ],
         },
@@ -326,7 +441,7 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
       provideCompletionItems: (model: any, position: any) => {
         const suggestions: any[] = [];
 
-        const kw = ["pack", "namespace", "func", "var", "let", "Say"];
+        const kw = ["pack", "namespace", "func", "var", "let", "Say", "Execute", "if", "unless", "Run"];
         for (const k of kw) suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Keyword, insertText: k });
 
         const packIds = Object.keys(symbols.packs);
@@ -351,16 +466,16 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
         }
 
         suggestions.push({
-          label: "pack block",
+          label: "Execute block",
           kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `pack "My Pack" namespace mypack{
-    var Greeting = "Hello";
-    func Load(){
-        Say(Greeting);
+          insertText: `Execute(as @s, at @s){
+    if("entity @s"){
+        Say("Hi");
+        Run("time set day");
     }
 }
 `,
-          detail: "Insert pack template",
+          detail: "Insert Execute block",
         });
 
         return { suggestions };
@@ -372,15 +487,16 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
 }
 
 // ---------- UI ----------
-const DEFAULT_SOURCE = `pack "Test Pack" namespace test{
-    var Greeting = "Hello ";
+const DEFAULT_SOURCE = `pack "HelloWorld" namespace hw{
     func Load(){
-        Say(Greeting + "World");
-    }
+        Say("Hi")
 
-    func Tick(){
-        // call cross-pack below each tick
-        util.Ping();
+        Execute(as @s, at @s or positioned ~ ~ ~){
+            if("entity @s"){
+                Say("Hi")
+                Run("time set day")
+            }
+        }
     }
 }
 
@@ -424,17 +540,14 @@ function DiagnosticsPanel({ diags }: { diags: Diagnostic[] }) {
 
 function useDebounced<T>(value: T, delay = 300) {
   const [v, setV] = useState(value);
-  const t = useRef<number | null>(null); // 👈 initialize
-
+  const t = useRef<number | null>(null);
   useEffect(() => {
     if (t.current !== null) window.clearTimeout(t.current);
     t.current = window.setTimeout(() => setV(value), delay);
     return () => { if (t.current !== null) window.clearTimeout(t.current); };
   }, [value, delay]);
-
   return v;
 }
-
 
 export default function WebDatapackCompiler() {
   const monaco = useMonaco();
@@ -472,7 +585,7 @@ export default function WebDatapackCompiler() {
             <div className="h-9 w-9 rounded-xl bg-black/90 text-white grid place-items-center font-bold">DP</div>
             <div>
               <h1 className="text-xl font-bold">Datapack Web Compiler</h1>
-              <p className="text-xs text-black/60">Multi-pack • Variables • IntelliSense • Zip export</p>
+              <p className="text-xs text-black/60">Multi-pack • Variables • Execute • IntelliSense • Zip export</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -511,14 +624,16 @@ export default function WebDatapackCompiler() {
             </div>
 
             <div className="text-xs text-black/60 mt-2 space-y-1">
-              <p><b>Calls:</b> <code>util.Ping()</code> → <code>function util:ping</code>. <b>Auto-tags:</b> any <code>Load()</code> and <code>Tick()</code> in any pack are added to <code>minecraft:load</code> and <code>minecraft:tick</code>.</p>
-              <p><b>Vars:</b> pack-scope <code>var Name = "text" + Other;</code> usable in <code>Say(...)</code>.</p>
+              <p><b>Execute:</b> <code>Execute(as @s, at @s or positioned ~ ~ ~)</code> duplicates the inner commands per branch.</p>
+              <p><b>Conditions:</b> <code>if("entity @s")</code> or <code>unless("entity @e")</code> inside Execute to chain conditions.</p>
+              <p><b>Run:</b> <code>Run("time set day")</code> to emit arbitrary commands.</p>
+              <p><b>Calls:</b> <code>util.Ping()</code> → <code>function util:ping</code>. <b>Auto-tags:</b> any <code>Load()</code>/<code>Tick()</code> across packs are added to game tags.</p>
             </div>
           </div>
         </div>
 
         <footer className="mt-8 text-xs text-black/50">
-          Pack format: 48 (MC 1.21+). Drop the zip into <code>%APPDATA%\.minecraft\saves\&lt;World&gt;\datapacks</code>.
+          Pack format: 48. Drop the zip into <code>%APPDATA%\.minecraft\saves\&lt;World&gt;\datapacks</code>.
         </footer>
       </div>
     </div>
