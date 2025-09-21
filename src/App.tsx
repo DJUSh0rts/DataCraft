@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import JSZip from "jszip";
 import "./monaco-setup";
+import JSZip from "jszip";
 import Editor, { useMonaco } from "@monaco-editor/react";
-
 
 // =============================
 // Datapack Web Compiler
@@ -14,7 +13,7 @@ import Editor, { useMonaco } from "@monaco-editor/react";
 // - if(num == 1) style conditions (==, !=, <, <=, >, >=)
 // - for-loops: for (var i = 0 | i < 10 | i++) { ... }  /  for (num | num < 10 | num++) { ... }
 // - adv / recipe blocks (pack-scope) to emit JSON helpers
-// - Idempotent-ish scoreboard bootstrap (single global __core__:__setup)
+// - Global scoreboard bootstrap (__core__:__setup) added once to load
 // - Outputs (singular):
 //     data/<ns>/function/*.mcfunction
 //     data/<ns>/advancements/*.json
@@ -39,8 +38,8 @@ type Diagnostic = { severity: "Error" | "Warning" | "Info"; message: string; lin
 // Expressions
 type StringExpr = { kind: "String"; value: string; line: number; col: number };
 type NumberExpr = { kind: "Number"; value: number; line: number; col: number };
-type VarExpr = { kind: "Var"; name: string; line: number; col: number };
-type BinaryExpr = { kind: "Binary"; op: "+" | "-" | "*" | "/" | "%"; left: Expr; right: Expr };
+type VarExpr    = { kind: "Var"; name: string; line: number; col: number };
+type BinaryExpr = { kind: "Binary"; op: "+" | "-" | "*" | "/" | "%"; left: Expr; right: Expr; line: number; col: number };
 type Expr = StringExpr | NumberExpr | VarExpr | BinaryExpr;
 
 // Conditions
@@ -57,12 +56,12 @@ type ExecMod =
 type ExecVariant = { mods: ExecMod[] };
 
 // Statements
-type SayStmt = { kind: "Say"; expr: Expr };
-type RunStmt = { kind: "Run"; expr: Expr };
+type SayStmt    = { kind: "Say"; expr: Expr };
+type RunStmt    = { kind: "Run"; expr: Expr };
 type VarDeclStmt = { kind: "VarDecl"; isGlobal: boolean; name: string; init: Expr; line: number; col: number };
-type AssignStmt = { kind: "Assign"; name: string; op: "=" | "+=" | "-=" | "*=" | "/=" | "%="; expr: Expr; line: number; col: number };
-type CallStmt = { kind: "Call"; targetPack?: string; func: string; line: number; col: number };
-type IfBlock = { kind: "If"; negated: boolean; cond?: Condition | null; body: Stmt[]; line: number; col: number };
+type AssignStmt  = { kind: "Assign"; name: string; op: "=" | "+=" | "-=" | "*=" | "/=" | "%="; expr: Expr; line: number; col: number };
+type CallStmt    = { kind: "Call"; targetPack?: string; func: string; line: number; col: number };
+type IfBlock     = { kind: "If"; negated: boolean; cond?: Condition | null; body: Stmt[]; line: number; col: number };
 type ExecuteStmt = { kind: "Execute"; variants: ExecVariant[]; body: Stmt[] };
 type ForStmt = {
   kind: "For";
@@ -74,7 +73,7 @@ type ForStmt = {
 };
 type Stmt = SayStmt | VarDeclStmt | AssignStmt | CallStmt | ExecuteStmt | IfBlock | RunStmt | ForStmt;
 
-// Adv / Recipe (pack-scope declarations)
+// Adv / Recipe (pack-scope)
 type AdvDecl = {
   kind: "Adv";
   name: string;
@@ -85,7 +84,7 @@ type RecipeDecl = {
   name: string;
   type?: "shapeless";
   result?: { id: string; count?: number };
-  ingredients: string[]; // shapeless
+  ingredients: string[];
 };
 
 // Decls
@@ -210,19 +209,23 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     if (t.type === "LParen") { pos++; const e = parseExpr(); expect("RParen", "')'"); return e; }
     throw { message: `Unexpected token in expression: ${t.value ?? t.type}`, line: t.line, col: t.col };
   }
+
   function parseUnary(): Expr {
-    if (match("Minus")) {
+    const t = peek();
+    if (t.type === "Minus") {
+      pos++; // consume '-'
       const e = parseUnary();
-      return { kind: "Binary", op: "-", left: { kind: "Number", value: 0, line: e.line, col: e.col }, right: e };
+      return { kind: "Binary", op: "-", left: { kind: "Number", value: 0, line: t.line, col: t.col }, right: e, line: t.line, col: t.col };
     }
     return parsePrimary();
   }
+
   function parseMul(): Expr {
     let e = parseUnary();
     while (peek().type === "Star" || peek().type === "Slash" || peek().type === "Percent") {
       const opTok = peek(); pos++;
       const r = parseUnary();
-      e = { kind: "Binary", op: opTok.type === "Star" ? "*" : opTok.type === "Slash" ? "/" : "%", left: e, right: r };
+      e = { kind: "Binary", op: opTok.type === "Star" ? "*" : opTok.type === "Slash" ? "/" : "%", left: e, right: r, line: opTok.line, col: opTok.col };
     }
     return e;
   }
@@ -231,7 +234,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     while (peek().type === "Plus" || peek().type === "Minus") {
       const opTok = peek(); pos++;
       const r = parseMul();
-      e = { kind: "Binary", op: opTok.type === "Plus" ? "+" : "-", left: e, right: r };
+      e = { kind: "Binary", op: opTok.type === "Plus" ? "+" : "-", left: e, right: r, line: opTok.line, col: opTok.col };
     }
     return e;
   }
@@ -266,10 +269,8 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   }
 
   function parseAssignAfterName(nameTok: Token): AssignStmt {
-    // ++/-- sugar
     if (match("PlusPlus")) return { kind: "Assign", name: nameTok.value!, op: "+=", expr: { kind: "Number", value: 1, line: nameTok.line, col: nameTok.col }, line: nameTok.line, col: nameTok.col };
     if (match("MinusMinus")) return { kind: "Assign", name: nameTok.value!, op: "-=", expr: { kind: "Number", value: 1, line: nameTok.line, col: nameTok.col }, line: nameTok.line, col: nameTok.col };
-    // =, +=, -=, *=, /=, %=
     const nt = peek().type;
     if (nt === "Equals" || nt === "PlusEquals" || nt === "MinusEquals" || nt === "StarEquals" || nt === "SlashEquals" || nt === "PercentEquals") {
       pos++;
@@ -281,7 +282,6 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
       const expr = parseExpr(); match("Semicolon");
       return { kind: "Assign", name: nameTok.value!, op, expr, line: nameTok.line, col: nameTok.col };
     }
-    // bare identifier (used in for-init as no-op)
     return { kind: "Assign", name: nameTok.value!, op: "+=", expr: { kind: "Number", value: 0, line: nameTok.line, col: nameTok.col }, line: nameTok.line, col: nameTok.col };
   }
 
@@ -334,7 +334,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   }
 
   function parseFor(): ForStmt {
-    expect("Identifier"); // "for"
+    const kw = expect("Identifier"); // for
     expect("LParen");
 
     // init
@@ -377,7 +377,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     const body: Stmt[] = [];
     while (peek().type !== "RBrace" && peek().type !== "EOF") { const s = parseStmt(); if (s) body.push(s); }
     expect("RBrace");
-    return { kind: "For", init, cond, incr, body, line: 0, col: 0 };
+    return { kind: "For", init, cond, incr, body, line: kw.line, col: kw.col };
   }
 
   function parseAdv(): AdvDecl {
@@ -445,7 +445,6 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     }
 
     if (low === "var" || low === "let") {
-      // local var declarations are only allowed in 'for' init; here we warn and drop
       const d = parseVarDecl(false);
       diags.push({ severity: "Warning", message: `Local 'var' ignored outside for-loops. Use global var at pack scope.`, line: t.line, col: t.col });
       return d;
@@ -476,7 +475,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
       if (low === "execute") return parseExecute();
       if (low === "if" || low === "unless") return parseIfUnless();
       if (low === "for") return parseFor();
-      // IMPORTANT: adv/recipe are pack-scope only; don't parse them here.
+      // adv/recipe are pack-scope only.
       return parseAssignOrCallOrSayRun();
     }
     if (t.type === "RBrace") return null;
@@ -596,7 +595,6 @@ function validate(ast: Script): Diagnostic[] {
 // compile numeric expressions into scoreboard temps
 function compileNumericExpr(
   expr: Expr,
-  ns: string,
   emit: (cmd: string) => void,
   tmpCounter: { n: number },
   resolveVarScore: (name: string) => string
@@ -690,7 +688,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
 
   // Per-pack bootstrap & init
   for (const p of ast.packs) {
-    // bootstrap marker only (no scoreboard add here anymore)
+    // bootstrap marker only
     const boot = [`execute unless data storage ${p.namespace}:system bootstrap run function ${p.namespace}:__setup`];
     files.push({ path: `data/${p.namespace}/function/__bootstrap.mcfunction`, contents: boot.join("\n") + "\n" });
     const setup = [`data modify storage ${p.namespace}:system bootstrap set value 1b`];
@@ -712,7 +710,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         // number
         let tmpIdx = { n: 0 };
         const tmpLines: string[] = [];
-        const tmp = compileNumericExpr(g.init, p.namespace, (c) => tmpLines.push(c), tmpIdx, (n) => scoreName(p.namespace, n));
+        const tmp = compileNumericExpr(g.init, (c) => tmpLines.push(c), tmpIdx, (n) => scoreName(p.namespace, n));
         tmpLines.push(`scoreboard players operation ${scoreName(p.namespace, g.name)} vars = ${tmp} vars`);
         init.push(...tmpLines);
       }
@@ -723,7 +721,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     let forCounter = 0;
     for (const fn of p.functions) {
       const out: string[] = [];
-      const auxFns: GeneratedFile[] = [];
 
       function withChain(chain: string, cmd: string) {
         if (chain) out.push(`execute ${chain} run ${cmd}`); else out.push(cmd);
@@ -745,7 +742,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         // number
         const tmpIdx = { n: 0 };
         const tmpLines: string[] = [];
-        const tmp = compileNumericExpr(assign.expr, p.namespace, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
+        const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
         const target = `${resolveVar(assign.name)} vars`;
         const opMap: Record<AssignStmt["op"], string> = { "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=" };
         withChain(chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
@@ -761,7 +758,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         if (t === "number" && expr.kind !== "Var" && expr.kind !== "Number") {
           const tmpIdx = { n: 0 };
           const tmpLines: string[] = [];
-          const tmp = compileNumericExpr(expr, p.namespace, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
+          const tmp = compileNumericExpr(expr, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
           withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
           out.push(...tmpLines);
           return;
@@ -779,8 +776,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         // numeric compare
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
         const tmpIdx = { n: 0 };
-        const l = compileNumericExpr(cond.left, p.namespace, (c) => lines.push(makePref(chain)(c)), tmpIdx, resolveVar);
-        const r = compileNumericExpr(cond.right, p.namespace, (c) => lines.push(makePref(chain)(c)), tmpIdx, resolveVar);
+        const l = compileNumericExpr(cond.left, (c) => lines.push(makePref(chain)(c)), tmpIdx, resolveVar);
+        const r = compileNumericExpr(cond.right, (c) => lines.push(makePref(chain)(c)), tmpIdx, resolveVar);
         if (cond.op === "==" || cond.op === "!=") {
           const suf = `${negate ? "unless" : "if"} score ${l} vars ${cond.op === "==" ? "=" : "!="} ${r} vars`;
           return { lines, suffix: suf };
@@ -820,7 +817,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             localTypes[d.name] = "number";
             const tmpIdx = { n: 0 };
             const tmpLines: string[] = [];
-            const tmp = compileNumericExpr(d.init, p.namespace, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, (n) => localScores[n] ?? scoreName(p.namespace, n));
+            const tmp = compileNumericExpr(d.init, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, (n) => localScores[n] ?? scoreName(p.namespace, n));
             withChain(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
             out.push(...tmpLines);
           } else if ((stmt.init as any).kind === "Assign") {
@@ -838,17 +835,14 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
 
         // step: body + incr + recurse (entry)
         const stepLines: string[] = [];
-        // body
         for (const s of stmt.body) emitStmt(s, chain, localScores, localTypes);
-        // incr
         if (stmt.incr) emitAssign(stmt.incr, chain, localScores, localTypes);
-        // recurse
         stepLines.push(entryPref(`function ${p.namespace}:${entryName}`));
 
-        // write helpers
-        const entryFile: GeneratedFile = { path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" };
-        const stepFile : GeneratedFile = { path: `data/${p.namespace}/function/${stepName}.mcfunction`, contents: stepLines.join("\n") + "\n" };
-        files.push(entryFile, stepFile);
+        files.push(
+          { path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" },
+          { path: `data/${p.namespace}/function/${stepName}.mcfunction`,  contents: stepLines.join("\n") + "\n" }
+        );
 
         // kick off
         withChain(chain, `function ${p.namespace}:${entryName}`);
@@ -865,11 +859,10 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             emitAssign(st, chain, localScores, envTypes);
             return;
 
-          case "Run": {
-            if (!isStaticString(st.expr, envTypes)) { diagnostics.push({ severity: "Error", message: `Run(...) must be a static string`, line: st.expr.line, col: st.expr.col }); return; }
+          case "Run":
+            if (!isStaticString(st.expr, envTypes)) { diagnostics.push({ severity: "Error", message: `Run(...) must be a static string`, line: (st.expr as any).line ?? 0, col: (st.expr as any).col ?? 0 }); return; }
             withChain(chain, evalStaticString(st.expr)!);
             return;
-          }
 
           case "Say":
             emitSay(st.expr, chain, localScores, envTypes);
@@ -901,7 +894,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       // emit body
       for (const st of fn.body) emitStmt(st, "", null, packVarTypes[p.namespace]);
 
-      // write function + (loop helpers are already pushed)
       files.push({ path: `data/${p.namespace}/function/${fn.name}.mcfunction`, contents: out.join("\n") + (out.length ? "\n" : "") });
     }
 
