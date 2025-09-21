@@ -14,6 +14,7 @@ import Editor, { useMonaco } from "@monaco-editor/react";
 // - for-loops: for (var i = 0 | i < 10 | i++) { ... }  /  for (num | num < 10 | num++) { ... }
 // - adv / recipe blocks (pack-scope) to emit JSON helpers
 // - Global scoreboard bootstrap (__core__:__setup) added once to load
+// - Macro strings: Say($"Hello {i}") => macro line `$say Hello $(i)`
 // - Outputs (singular):
 //     data/<ns>/function/*.mcfunction
 //     data/<ns>/advancements/*.json
@@ -23,7 +24,7 @@ import Editor, { useMonaco } from "@monaco-editor/react";
 
 // ---------- Types ----------
 type TokenType =
-  | "Identifier" | "String" | "Number"
+  | "Identifier" | "String" | "MacroString" | "Number"
   | "LBrace" | "RBrace" | "LParen" | "RParen"
   | "Semicolon" | "Comma" | "Dot" | "Pipe"
   | "Plus" | "Minus" | "Star" | "Slash" | "Percent"
@@ -37,10 +38,11 @@ type Diagnostic = { severity: "Error" | "Warning" | "Info"; message: string; lin
 
 // Expressions
 type StringExpr = { kind: "String"; value: string; line: number; col: number };
+type MacroStringExpr = { kind: "MacroString"; raw: string; line: number; col: number };
 type NumberExpr = { kind: "Number"; value: number; line: number; col: number };
 type VarExpr    = { kind: "Var"; name: string; line: number; col: number };
 type BinaryExpr = { kind: "Binary"; op: "+" | "-" | "*" | "/" | "%"; left: Expr; right: Expr; line: number; col: number };
-type Expr = StringExpr | NumberExpr | VarExpr | BinaryExpr;
+type Expr = StringExpr | MacroStringExpr | NumberExpr | VarExpr | BinaryExpr;
 
 // Conditions
 type CmpOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
@@ -136,6 +138,29 @@ function lex(input: string): Token[] {
       col += (j - i); i = j; continue;
     }
 
+    // MACRO string: $" ... "
+    if (ch === "$" && peek(1) === "\"") {
+      const L = line, C = col;
+      // consume $" opener
+      i += 2; col += 2;
+      let text = "";
+      while (i < input.length) {
+        const c = input[i];
+        if (c === "\\") {
+          const n = input[i + 1];
+          if (n === "\"" || n === "\\" || n === "n" || n === "t") {
+            text += n === "n" ? "\n" : n === "t" ? "\t" : n;
+            i += 2; col += 2; continue;
+          }
+        }
+        if (c === "\"") { i++; col++; break; }
+        if (c === "\n") { i++; line++; col = 1; continue; }
+        text += c; i++; col++;
+      }
+      push({ type: "MacroString", value: text, line: L, col: C });
+      continue;
+    }
+
     // strings
     if (ch === "\"") {
       let j = i + 1; let text = ""; const L = line, C = col;
@@ -203,6 +228,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
   function parsePrimary(): Expr {
     const t = peek();
+    if (t.type === "MacroString") { pos++; return { kind: "MacroString", raw: t.value!, line: t.line, col: t.col }; }
     if (t.type === "String") { pos++; return { kind: "String", value: t.value!, line: t.line, col: t.col }; }
     if (t.type === "Number") { pos++; return { kind: "Number", value: Number(t.value!), line: t.line, col: t.col }; }
     if (t.type === "Identifier") { pos++; return { kind: "Var", name: t.value!, line: t.line, col: t.col }; }
@@ -475,7 +501,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
       if (low === "execute") return parseExecute();
       if (low === "if" || low === "unless") return parseIfUnless();
       if (low === "for") return parseFor();
-      // adv/recipe are pack-scope only.
+      // adv/recipe are pack-scope only; here only inside funcs.
       return parseAssignOrCallOrSayRun();
     }
     if (t.type === "RBrace") return null;
@@ -542,6 +568,7 @@ function tmpScoreName(idx: number) { return `__tmp${idx}`; }
 
 function inferType(expr: Expr, envTypes: Record<string, VarKind | undefined>): VarKind | undefined {
   switch (expr.kind) {
+    case "MacroString": return "string";
     case "String": return "string";
     case "Number": return "number";
     case "Var": return envTypes[expr.name];
@@ -560,6 +587,7 @@ function isStaticString(expr: Expr, envTypes: Record<string, VarKind | undefined
   switch (expr.kind) {
     case "String": return true;
     case "Number": return true;
+    case "MacroString": return false;
     case "Var": return false;
     case "Binary": return expr.op === "+" && isStaticString(expr.left, envTypes) && isStaticString(expr.right, envTypes);
   }
@@ -592,6 +620,9 @@ function validate(ast: Script): Diagnostic[] {
   return diags;
 }
 
+// helper to prefix commands with execute chain
+const prefixed = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
+
 // compile numeric expressions into scoreboard temps
 function compileNumericExpr(
   expr: Expr,
@@ -619,6 +650,7 @@ function compileNumericExpr(
         return;
       }
       case "String":
+      case "MacroString":
         emit(`scoreboard players set ${target} vars 0`);
         return;
     }
@@ -641,6 +673,9 @@ function exprToTellrawComponents(
     switch (e.kind) {
       case "String": parts.push({ text: e.value }); return;
       case "Number": parts.push({ text: String(e.value) }); return;
+      case "MacroString":
+        // treat as plain text if it ever falls through (should be handled earlier for Say)
+        parts.push({ text: e.raw }); return;
       case "Var": {
         const t = types[e.name];
         if (!t) { parts.push({ text: `<${e.name}>` }); ok = false; return; }
@@ -722,35 +757,43 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     for (const fn of p.functions) {
       const out: string[] = [];
 
-      function withChain(chain: string, cmd: string) {
-        if (chain) out.push(`execute ${chain} run ${cmd}`); else out.push(cmd);
-      }
-      function makePref(chain: string) {
-        return (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
-      }
+      const withChainTo = (arr: string[], chain: string, cmd: string) => {
+        arr.push(chain ? `execute ${chain} run ${cmd}` : cmd);
+      };
+      const makePrefTo = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
 
-      function emitAssign(assign: AssignStmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>) {
+      const emitAssign = (assign: AssignStmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, sink: string[]) => {
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
         const vk = envTypes[assign.name] || (localScores && assign.name in localScores ? "number" : undefined);
         if (!vk) { diagnostics.push({ severity: "Error", message: `Unknown variable '${assign.name}'`, line: assign.line, col: assign.col }); return; }
         if (vk === "string") {
           if (assign.op !== "=") { diagnostics.push({ severity: "Error", message: `Only '=' supported for string variables`, line: assign.line, col: assign.col }); return; }
-          if (isStaticString(assign.expr, envTypes)) withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(evalStaticString(assign.expr)!)}`);
+          if (isStaticString(assign.expr, envTypes)) withChainTo(sink, chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(evalStaticString(assign.expr)!)}`);
           else diagnostics.push({ severity: "Error", message: `Dynamic string assignment not supported`, line: assign.line, col: assign.col });
           return;
         }
         // number
         const tmpIdx = { n: 0 };
         const tmpLines: string[] = [];
-        const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
+        const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePrefTo(chain)(c)), tmpIdx, resolveVar);
         const target = `${resolveVar(assign.name)} vars`;
         const opMap: Record<AssignStmt["op"], string> = { "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=" };
-        // emit computations first, then the operation using the temp
-        out.push(...tmpLines);
-        withChain(chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
-      }
+        sink.push(...tmpLines);
+        withChainTo(sink, chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
+      };
 
-      function emitSay(expr: Expr, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>) {
+      const emitSay = (expr: Expr, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, sink: string[]) => {
+        // Macro-string fast path: Say($"Hello {i}") -> $say Hello $(i)  (or $execute ... run say ...)
+        if (expr.kind === "MacroString") {
+          const text = expr.raw.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => `$(${name})`);
+          if (chain && chain.trim().length) {
+            sink.push(`$execute ${chain} run say ${text}`);
+          } else {
+            sink.push(`$say ${text}`);
+          }
+          return;
+        }
+
         const types: Record<string, VarKind> = { ...envTypes };
         if (localScores) for (const k of Object.keys(localScores)) types[k] = "number";
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
@@ -759,43 +802,47 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         if (t === "number" && expr.kind !== "Var" && expr.kind !== "Number") {
           const tmpIdx = { n: 0 };
           const tmpLines: string[] = [];
-          const tmp = compileNumericExpr(expr, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
-          // emit computations before using the score
-          out.push(...tmpLines);
-          withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
+          const tmp = compileNumericExpr(expr, (c) => tmpLines.push(makePrefTo(chain)(c)), tmpIdx, resolveVar);
+          sink.push(...tmpLines);
+          withChainTo(sink, chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
           return;
         }
         const { comps, ok } = exprToTellrawComponents(expr, p.namespace, types, resolveVar);
-        if (ok && comps.length === 1 && "text" in comps[0]) withChain(chain, `say ${JSON.stringify(comps[0].text)}`);
-        else if (ok) withChain(chain, `tellraw @a ${JSON.stringify(comps)}`);
+        if (ok && comps.length === 1 && "text" in comps[0]) withChainTo(sink, chain, `say ${JSON.stringify(comps[0].text)}`);
+        else if (ok) withChainTo(sink, chain, `tellraw @a ${JSON.stringify(comps)}`);
         else diagnostics.push({ severity: "Error", message: `Say(...) supports literals, +, and simple vars.`, line: (expr as any).line ?? 0, col: (expr as any).col ?? 0 });
-      }
+      };
 
-      function condToExecuteSuffix(
+      const condToExecuteSuffix = (
         cond: Condition | null | undefined,
         chain: string,
-        localScores: Record<string, string> | null,
-        negate = false
-      ): { lines: string[], suffix: string } {
+        localScores: Record<string, string> | null
+      ): { lines: string[], suffix: string } => {
         const lines: string[] = [];
         if (!cond) return { lines, suffix: "" };
-        if (cond.kind === "Raw") return { lines, suffix: `${negate ? "unless" : "if"} ${cond.raw}` };
+        if (cond.kind === "Raw") return { lines, suffix: `if ${cond.raw}` };
         // numeric compare
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
         const tmpIdx = { n: 0 };
-        const l = compileNumericExpr(cond.left, (c) => lines.push(makePref(chain)(c)), tmpIdx, resolveVar);
-        const r = compileNumericExpr(cond.right, (c) => lines.push(makePref(chain)(c)), tmpIdx, resolveVar);
-        if (cond.op === "==" || cond.op === "!=") {
-          const suf = `${negate ? "unless" : "if"} score ${l} vars ${cond.op === "==" ? "=" : "!="} ${r} vars`;
-          return { lines, suffix: suf };
-        } else {
-          const opMap: Record<CmpOp, string> = { "==": "=", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=" };
-          return { lines, suffix: `${negate ? "unless" : "if"} score ${l} vars ${opMap[cond.op]} ${r} vars` };
-        }
-      }
+        const l = compileNumericExpr(cond.left, (c) => lines.push(makePrefTo(chain)(c)), tmpIdx, resolveVar);
+        const r = compileNumericExpr(cond.right, (c) => lines.push(makePrefTo(chain)(c)), tmpIdx, resolveVar);
+        const map: Record<CmpOp, string> = { "==": "=", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=" };
+        return { lines, suffix: `if score ${l} vars ${map[cond.op]} ${r} vars` };
+      };
 
-      function emitExecute(stmt: ExecuteStmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>) {
-        if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes); return; }
+      const condToExecuteSuffixWithNegate = (
+        cond: Condition | null | undefined,
+        chain: string,
+        localScores: Record<string, string> | null,
+        negate: boolean
+      ): { lines: string[], suffix: string } => {
+        const r = condToExecuteSuffix(cond, chain, localScores);
+        if (!r.suffix) return r;
+        return { lines: r.lines, suffix: (negate ? r.suffix.replace(/^if /, "unless ") : r.suffix) };
+      };
+
+      const emitExecute = (stmt: ExecuteStmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, sink: string[]) => {
+        if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, sink); return; }
         for (const v of stmt.variants) {
           const parts: string[] = [];
           for (const m of v.mods) {
@@ -804,11 +851,11 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             else if (m.kind === "positioned") parts.push(`positioned ${m.x} ${m.y} ${m.z}`);
           }
           const next = [chain, parts.join(" ")].filter(Boolean).join(" ");
-          for (const s of stmt.body) emitStmt(s, next, localScores, envTypes);
+          for (const s of stmt.body) emitStmt(s, next, localScores, envTypes, sink);
         }
-      }
+      };
 
-      function emitFor(stmt: ForStmt, chain: string, envTypes: Record<string, VarKind>) {
+      const emitFor = (stmt: ForStmt, chain: string, envTypes: Record<string, VarKind>, sink: string[]) => {
         const loopId = forCounter++;
         const entryName = `__for_${fn.name}_${loopId}`;
         const stepName  = `__for_${fn.name}_${loopId}__step`;
@@ -824,28 +871,27 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             localTypes[d.name] = "number";
             const tmpIdx = { n: 0 };
             const tmpLines: string[] = [];
-            const tmp = compileNumericExpr(d.init, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, (n) => localScores[n] ?? scoreName(p.namespace, n));
-            // computations first
-            out.push(...tmpLines);
-            withChain(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
+            const tmp = compileNumericExpr(d.init, (c) => tmpLines.push(makePrefTo(chain)(c)), tmpIdx, (n) => localScores[n] ?? scoreName(p.namespace, n));
+            sink.push(...tmpLines);
+            withChainTo(sink, chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
           } else if ((stmt.init as any).kind === "Assign") {
-            emitAssign(stmt.init as AssignStmt, chain, null, envTypes);
+            emitAssign(stmt.init as AssignStmt, chain, localScores, localTypes, sink);
           }
         }
 
         // entry: condition (if provided) -> step
         const entryLines: string[] = [];
-        const entryPref = (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
-        const { lines: condLines, suffix } = condToExecuteSuffix(stmt.cond ?? null, chain, localScores, false);
-        entryLines.push(...condLines.map(entryPref));
-        if (suffix) entryLines.push(entryPref(`execute ${suffix} run function ${p.namespace}:${stepName}`));
-        else entryLines.push(entryPref(`function ${p.namespace}:${stepName}`));
+        const prefix = (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
+        const { lines: condLines, suffix } = condToExecuteSuffix(stmt.cond ?? null, chain, localScores);
+        entryLines.push(...condLines.map(prefix));
+        if (suffix) entryLines.push(prefix(`execute ${suffix} run function ${p.namespace}:${stepName}`));
+        else entryLines.push(prefix(`function ${p.namespace}:${stepName}`));
 
         // step: body + incr + recurse (entry)
         const stepLines: string[] = [];
-        for (const s of stmt.body) emitStmt(s, chain, localScores, localTypes);
-        if (stmt.incr) emitAssign(stmt.incr, chain, localScores, localTypes);
-        stepLines.push(entryPref(`function ${p.namespace}:${entryName}`));
+        for (const s of stmt.body) emitStmt(s, chain, localScores, localTypes, stepLines);
+        if (stmt.incr) emitAssign(stmt.incr, chain, localScores, localTypes, stepLines);
+        stepLines.push(prefix(`function ${p.namespace}:${entryName}`));
 
         files.push(
           { path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" },
@@ -853,10 +899,10 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         );
 
         // kick off
-        withChain(chain, `function ${p.namespace}:${entryName}`);
-      }
+        withChainTo(sink, chain, `function ${p.namespace}:${entryName}`);
+      };
 
-      function emitStmt(st: Stmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>) {
+      function emitStmt(st: Stmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, sink: string[]) {
         switch (st.kind) {
           case "VarDecl":
             if (st.isGlobal) { diagnostics.push({ severity: "Warning", message: `global var must be declared at pack scope`, line: st.line, col: st.col }); }
@@ -864,43 +910,43 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             return;
 
           case "Assign":
-            emitAssign(st, chain, localScores, envTypes);
+            emitAssign(st, chain, localScores, envTypes, sink);
             return;
 
           case "Run":
             if (!isStaticString(st.expr, envTypes)) { diagnostics.push({ severity: "Error", message: `Run(...) must be a static string`, line: (st.expr as any).line ?? 0, col: (st.expr as any).col ?? 0 }); return; }
-            withChain(chain, evalStaticString(st.expr)!);
+            withChainTo(sink, chain, evalStaticString(st.expr)!);
             return;
 
           case "Say":
-            emitSay(st.expr, chain, localScores, envTypes);
+            emitSay(st.expr, chain, localScores, envTypes, sink);
             return;
 
           case "Call": {
             const targetNs = st.targetPack ? st.targetPack.toLowerCase() : p.namespace;
-            withChain(chain, `function ${targetNs}:${st.func.toLowerCase()}`);
+            withChainTo(sink, chain, `function ${targetNs}:${st.func.toLowerCase()}`);
             return;
           }
 
           case "If": {
-            const { lines, suffix } = condToExecuteSuffix(st.cond ?? null, chain, localScores, st.negated);
-            out.push(...lines);
-            for (const inner of st.body) emitStmt(inner, [chain, suffix].filter(Boolean).join(" "), localScores, envTypes);
+            const { lines, suffix } = condToExecuteSuffixWithNegate(st.cond ?? null, chain, localScores, st.negated);
+            sink.push(...lines);
+            for (const inner of st.body) emitStmt(inner, [chain, suffix].filter(Boolean).join(" "), localScores, envTypes, sink);
             return;
           }
 
           case "Execute":
-            emitExecute(st, chain, localScores, envTypes);
+            emitExecute(st, chain, localScores, envTypes, sink);
             return;
 
           case "For":
-            emitFor(st, chain, envTypes);
+            emitFor(st, chain, envTypes, sink);
             return;
         }
       }
 
-      // emit body
-      for (const st of fn.body) emitStmt(st, "", null, packVarTypes[p.namespace]);
+      // emit body into `out`
+      for (const st of fn.body) emitStmt(st, "", null, packVarTypes[p.namespace], out);
 
       files.push({ path: `data/${p.namespace}/function/${fn.name}.mcfunction`, contents: out.join("\n") + (out.length ? "\n" : "") });
     }
@@ -973,6 +1019,8 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
       monaco.languages.setMonarchTokensProvider(id, {
         tokenizer: {
           root: [
+            // try to color macro strings as strings
+            [/\$\"[^\"]*\"/, "string"],
             [/pack|namespace|func|global|var|let|Say|say|Execute|execute|if|unless|Run|run|for|adv|recipe|criterion|title|description|desc|icon|parent|type|ingredient|result/, "keyword"],
             [/\d+/, "number"],
             [/\"[^\"]*\"/, "string"],
@@ -1004,6 +1052,12 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
           kind: monaco.languages.CompletionItemKind.Snippet,
           insertText: `for (num | num < 10 | num++){\n    Say("num=" + num)\n}\n`,
           detail: "Loop over a global number"
+        });
+        suggestions.push({
+          label: "macro say",
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText: `Say($\"Hello {i}\")`,
+          detail: "Macro-interpolated Say"
         });
         suggestions.push({
           label: "adv block",
@@ -1050,44 +1104,15 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
 
 // ---------- UI ----------
 const DEFAULT_SOURCE = `pack "Hello World" namespace hw{
-  global var num = 1
-
   func Load(){
-    Say("Loaded!");
+    for (var i = 0 | i < 10 | i++){
+      Say(i)
+      Say($\"i is {i}\")
+      Say("literal {i} (no macro)")
+    }
   }
 
   func Tick(){
-    Execute(){
-      if(num == 1){
-        Say("num is one")
-      }
-      unless("entity @e[type=zombie]"){
-        Say("no zombies around")
-      }
-    }
-
-    for (var i = 0 | i < 3 | i++){
-      Say("i=" + i)
-    }
-
-    for (num | num < 5 | num++){
-      Say("num=" + num)
-    }
-  }
-
-  // Pack-scope helpers:
-  adv Welcome(){
-    title "Welcome!";
-    description "You joined the world.";
-    icon minecraft:oak_sapling;
-    criterion got_here "minecraft:impossible";
-  }
-
-  recipe Torch{
-    type shapeless;
-    ingredient minecraft:stick;
-    ingredient minecraft:coal;
-    result minecraft:torch 4;
   }
 }
 `;
@@ -1164,14 +1189,14 @@ export default function WebDatapackCompiler() {
   const selectedFile = useMemo(() => compiled.files.find(f => f.path === selectedPath), [compiled.files, selectedPath]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 text-black">
+    <div className="min-h-screen bg-gradient-to-b from-white to -slate-50 text-black">
       <div className="mx-auto max-w-7xl p-6">
         <header className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <div className="h-9 w-9 rounded-xl bg-black/90 text-white grid place-items-center font-bold">DP</div>
             <div>
               <h1 className="text-xl font-bold">Datapack Web Compiler</h1>
-              <p className="text-xs text-black/60">Globals • Execute • for-loops • Adv/Recipes • IntelliSense • Zip export</p>
+              <p className="text-xs text-black/60">Globals • Execute • for-loops • Macros in strings • Adv/Recipes • IntelliSense • Zip export</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -1211,6 +1236,7 @@ export default function WebDatapackCompiler() {
 
             <div className="text-xs text-black/60 mt-2 space-y-1">
               <p><b>for:</b> <code>for (var i = 0 | i &lt; 10 | i++)</code> or <code>for (num | num &lt; 10 | num++)</code></p>
+              <p><b>macro strings:</b> <code>Say($\"Hello {`{`}i{`}`}\")</code> ⇒ <code>$say Hello $(i)</code> (literal <code>Say("Hello {`{`}i{`}`}")</code> is not a macro)</p>
               <p><b>if:</b> <code>if(num == 1)</code> or raw <code>if("entity @s")</code></p>
               <p><b>adv:</b> <code>adv Name() {'{'} title "X"; icon minecraft:stone; criterion got "minecraft:impossible"; {'}'}</code> (pack scope)</p>
               <p><b>recipe:</b> <code>recipe Name {'{'} type shapeless; ingredient minecraft:stick; result minecraft:torch 4; {'}'}</code> (pack scope)</p>
