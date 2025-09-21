@@ -537,7 +537,7 @@ const PACK_FORMAT = 48; // MC 1.21+
 type VarKind = "string" | "number";
 
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
-function localScoreName(ns: string, fn: string, idx: number, name: string) { return `__${fn}_for${idx}_${name}`; }
+function localScoreName(fn: string, idx: number, name: string) { return `__${fn}_for${idx}_${name}`; }
 function tmpScoreName(idx: number) { return `__tmp${idx}`; }
 
 function inferType(expr: Expr, envTypes: Record<string, VarKind | undefined>): VarKind | undefined {
@@ -745,8 +745,9 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
         const target = `${resolveVar(assign.name)} vars`;
         const opMap: Record<AssignStmt["op"], string> = { "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=" };
-        withChain(chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
+        // emit computations first, then the operation using the temp
         out.push(...tmpLines);
+        withChain(chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
       }
 
       function emitSay(expr: Expr, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>) {
@@ -759,8 +760,9 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           const tmpIdx = { n: 0 };
           const tmpLines: string[] = [];
           const tmp = compileNumericExpr(expr, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, resolveVar);
-          withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
+          // emit computations before using the score
           out.push(...tmpLines);
+          withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
           return;
         }
         const { comps, ok } = exprToTellrawComponents(expr, p.namespace, types, resolveVar);
@@ -769,7 +771,12 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         else diagnostics.push({ severity: "Error", message: `Say(...) supports literals, +, and simple vars.`, line: (expr as any).line ?? 0, col: (expr as any).col ?? 0 });
       }
 
-      function condToExecuteSuffix(cond: Condition | null | undefined, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, negate = false): { lines: string[], suffix: string } {
+      function condToExecuteSuffix(
+        cond: Condition | null | undefined,
+        chain: string,
+        localScores: Record<string, string> | null,
+        negate = false
+      ): { lines: string[], suffix: string } {
         const lines: string[] = [];
         if (!cond) return { lines, suffix: "" };
         if (cond.kind === "Raw") return { lines, suffix: `${negate ? "unless" : "if"} ${cond.raw}` };
@@ -813,13 +820,14 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         if (stmt.init && "kind" in stmt.init) {
           if ((stmt.init as any).kind === "VarDecl" && !(stmt.init as VarDeclStmt).isGlobal) {
             const d = stmt.init as VarDeclStmt;
-            localScores[d.name] = localScoreName(p.namespace, fn.name, loopId, d.name);
+            localScores[d.name] = localScoreName(fn.name, loopId, d.name);
             localTypes[d.name] = "number";
             const tmpIdx = { n: 0 };
             const tmpLines: string[] = [];
             const tmp = compileNumericExpr(d.init, (c) => tmpLines.push(makePref(chain)(c)), tmpIdx, (n) => localScores[n] ?? scoreName(p.namespace, n));
-            withChain(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
+            // computations first
             out.push(...tmpLines);
+            withChain(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
           } else if ((stmt.init as any).kind === "Assign") {
             emitAssign(stmt.init as AssignStmt, chain, null, envTypes);
           }
@@ -828,7 +836,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         // entry: condition (if provided) -> step
         const entryLines: string[] = [];
         const entryPref = (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
-        const { lines: condLines, suffix } = condToExecuteSuffix(stmt.cond ?? null, chain, localScores, localTypes, false);
+        const { lines: condLines, suffix } = condToExecuteSuffix(stmt.cond ?? null, chain, localScores, false);
         entryLines.push(...condLines.map(entryPref));
         if (suffix) entryLines.push(entryPref(`execute ${suffix} run function ${p.namespace}:${stepName}`));
         else entryLines.push(entryPref(`function ${p.namespace}:${stepName}`));
@@ -875,7 +883,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           }
 
           case "If": {
-            const { lines, suffix } = condToExecuteSuffix(st.cond ?? null, chain, localScores, envTypes, st.negated);
+            const { lines, suffix } = condToExecuteSuffix(st.cond ?? null, chain, localScores, st.negated);
             out.push(...lines);
             for (const inner of st.body) emitStmt(inner, [chain, suffix].filter(Boolean).join(" "), localScores, envTypes);
             return;
