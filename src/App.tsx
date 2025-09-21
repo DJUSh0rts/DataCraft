@@ -620,9 +620,6 @@ function validate(ast: Script): Diagnostic[] {
   return diags;
 }
 
-// helper to prefix commands with execute chain
-const prefixed = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
-
 // compile numeric expressions into scoreboard temps
 function compileNumericExpr(
   expr: Expr,
@@ -674,7 +671,6 @@ function exprToTellrawComponents(
       case "String": parts.push({ text: e.value }); return;
       case "Number": parts.push({ text: String(e.value) }); return;
       case "MacroString":
-        // treat as plain text if it ever falls through (should be handled earlier for Say)
         parts.push({ text: e.raw }); return;
       case "Var": {
         const t = types[e.name];
