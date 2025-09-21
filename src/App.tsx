@@ -14,7 +14,7 @@ import Editor, { useMonaco } from "@monaco-editor/react";
 // - for-loops: for (var i = 0 | i < 10 | i++) { ... }  /  for (num | num < 10 | num++) { ... }
 // - adv / recipe blocks (pack-scope) to emit JSON helpers
 // - Global scoreboard bootstrap (__core__:__setup) added once to load
-// - Macro strings: Say($"Hello {i}") => macro line `$say Hello $(i)`
+// - Macro strings: Say($"...{x}...") and Run($"...{x}...")
 // - Outputs (singular):
 //     data/<ns>/function/*.mcfunction
 //     data/<ns>/advancements/*.json
@@ -779,7 +779,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       };
 
       const emitSay = (expr: Expr, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, sink: string[]) => {
-        // Macro-string fast path: Say($"Hello {i}") -> $say Hello $(i)  (or $execute ... run say ...)
+        // Macro-string: Say($"Hello {i}") -> $say Hello $(i)
         if (expr.kind === "MacroString") {
           const text = expr.raw.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => `$(${name})`);
           if (chain && chain.trim().length) {
@@ -909,10 +909,21 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             emitAssign(st, chain, localScores, envTypes, sink);
             return;
 
-          case "Run":
-            if (!isStaticString(st.expr, envTypes)) { diagnostics.push({ severity: "Error", message: `Run(...) must be a static string`, line: (st.expr as any).line ?? 0, col: (st.expr as any).col ?? 0 }); return; }
+          case "Run": {
+            // NEW: Macro support for Run($"...{x}...")
+            if (st.expr.kind === "MacroString") {
+              const text = st.expr.raw.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => `$(${name})`);
+              if (chain && chain.trim().length) sink.push(`$execute ${chain} run ${text}`);
+              else sink.push(`$${text}`);
+              return;
+            }
+            if (!isStaticString(st.expr, envTypes)) {
+              diagnostics.push({ severity: "Error", message: `Run(...) must be a static string or a macro string`, line: (st.expr as any).line ?? 0, col: (st.expr as any).col ?? 0 });
+              return;
+            }
             withChainTo(sink, chain, evalStaticString(st.expr)!);
             return;
+          }
 
           case "Say":
             emitSay(st.expr, chain, localScores, envTypes, sink);
@@ -1056,6 +1067,12 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
           detail: "Macro-interpolated Say"
         });
         suggestions.push({
+          label: "macro run",
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText: `Run($\"tp @s ~ {i} ~\")`,
+          detail: "Macro-interpolated Run"
+        });
+        suggestions.push({
           label: "adv block",
           kind: monaco.languages.CompletionItemKind.Snippet,
           insertText: `adv MyAdv(){\n    title "My Advancement";\n    description "Do the thing";\n    icon minecraft:stone;\n    // criterion name "minecraft:impossible"\n}\n`,
@@ -1104,6 +1121,7 @@ const DEFAULT_SOURCE = `pack "Hello World" namespace hw{
     for (var i = 0 | i < 10 | i++){
       Say(i)
       Say($\"i is {i}\")
+      Run($\"say loop index {i}\")
       Say("literal {i} (no macro)")
     }
   }
@@ -1192,7 +1210,7 @@ export default function WebDatapackCompiler() {
             <div className="h-9 w-9 rounded-xl bg-black/90 text-white grid place-items-center font-bold">DP</div>
             <div>
               <h1 className="text-xl font-bold">Datapack Web Compiler</h1>
-              <p className="text-xs text-black/60">Globals • Execute • for-loops • Macros in strings • Adv/Recipes • IntelliSense • Zip export</p>
+              <p className="text-xs text-black/60">Globals • Execute • for-loops • Macros in Say/Run • Adv/Recipes • IntelliSense • Zip export</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -1232,7 +1250,7 @@ export default function WebDatapackCompiler() {
 
             <div className="text-xs text-black/60 mt-2 space-y-1">
               <p><b>for:</b> <code>for (var i = 0 | i &lt; 10 | i++)</code> or <code>for (num | num &lt; 10 | num++)</code></p>
-              <p><b>macro strings:</b> <code>Say($\"Hello {`{`}i{`}`}\")</code> ⇒ <code>$say Hello $(i)</code> (literal <code>Say("Hello {`{`}i{`}`}")</code> is not a macro)</p>
+              <p><b>macro strings:</b> <code>Say($\"Hello {`{`}i{`}`}\")</code>, <code>Run($\"time set {`{`}i{`}`}\")</code></p>
               <p><b>if:</b> <code>if(num == 1)</code> or raw <code>if("entity @s")</code></p>
               <p><b>adv:</b> <code>adv Name() {'{'} title "X"; icon minecraft:stone; criterion got "minecraft:impossible"; {'}'}</code> (pack scope)</p>
               <p><b>recipe:</b> <code>recipe Name {'{'} type shapeless; ingredient minecraft:stick; result minecraft:torch 4; {'}'}</code> (pack scope)</p>
