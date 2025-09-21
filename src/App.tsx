@@ -487,22 +487,13 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
 }
 
 // ---------- UI ----------
-const DEFAULT_SOURCE = `pack "HelloWorld" namespace hw{
+const DEFAULT_SOURCE = `pack "Hello World" namespace hw{
     func Load(){
-        Say("Hi")
-
-        Execute(as @s, at @s or positioned ~ ~ ~){
-            if("entity @s"){
-                Say("Hi")
-                Run("time set day")
-            }
-        }
+        Say("Hello World")
     }
-}
 
-pack "Utilities" namespace util{
-    func Ping(){
-        Say("Pong");
+    func Tick(){
+
     }
 }`;
 
