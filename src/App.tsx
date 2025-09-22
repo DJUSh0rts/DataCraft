@@ -798,6 +798,9 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
 // ---------- Validation & Helpers ----------
 const PACK_FORMAT = 48;
+
+void PACK_FORMAT;
+
 type VarKind = "string" | "number";
 
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
@@ -1054,6 +1057,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       const pref = tokensToPref(chain);
       const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
       void envTypes;
+
+      void outArr;
 
       function leaf(c: CmpCond | RawCond): string[] {
         if ((c as RawCond).kind === "Raw") {
