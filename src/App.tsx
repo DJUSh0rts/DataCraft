@@ -520,37 +520,61 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     return collected;
   }
 
-  function parseItem(): ItemDecl {
-    expect("Identifier"); // Item
-    const nameTok = expect("Identifier");
-    if (match("LParen")) expect("RParen");
-    expect("LBrace");
-    let baseId = "minecraft:stone";
-    let comps: Token[] | undefined;
-    while (peek().type !== "RBrace" && peek().type !== "EOF") {
-      const t = expect("Identifier");
-      const low = t.value!.toLowerCase();
-      if (low === "base_id") {
-        expect("Equals");
-        const v = peek();
-        if (v.type === "String" || v.type === "Identifier") { pos++; baseId = (v.value ?? "").toString(); }
-        else throw { message: `base_id must be string or identifier`, line: v.line, col: v.col };
-        match("Semicolon");
-        continue;
+  // --- replace your parseItem() with this ---
+function parseItem(): ItemDecl {
+  expect("Identifier"); // Item
+  const nameTok = expect("Identifier");
+  if (match("LParen")) expect("RParen");
+  expect("LBrace");
+
+  let baseId = "minecraft:stone";
+  let comps: Token[] | undefined;
+
+  while (peek().type !== "RBrace" && peek().type !== "EOF") {
+    // read the raw key (could be "components" or "components:")
+    const t = expect("Identifier");
+    const rawKey = t.value || "";
+    const key = rawKey.toLowerCase().replace(/:$/, ""); // <- allow a trailing colon in the key
+
+    if (key === "base_id") {
+      // allow either "base_id =" or "base_id :" (we still prefer "=")
+      if (peek().type === "Equals" || peek().type === "Colon") pos++;
+      const v = peek();
+      if (v.type === "String" || v.type === "Identifier") {
+        pos++;
+        baseId = String(v.value ?? "");
+      } else {
+        throw { message: `base_id must be string or identifier`, line: v.line, col: v.col };
       }
-      if (low === "components") {
-        expect("Colon");
-        comps = grabBracketTokenBlock();
-        match("Semicolon");
-        continue;
-      }
-      diags.push({ severity: "Warning", message: `Unknown Item property '${t.value}'`, line: t.line, col: t.col });
-      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
       match("Semicolon");
+      continue;
     }
-    expect("RBrace");
-    return { kind: "Item", name: nameTok.value!, baseId, componentTokens: comps, line: nameTok.line, col: nameTok.col };
+
+    if (key === "components") {
+      // accept "components:" or "components :" or even "components" then a bracket
+      if (peek().type === "Colon") pos++; // consume optional colon
+      comps = grabBracketTokenBlock();    // collects everything inside [...]
+      match("Semicolon");
+      continue;
+    }
+
+    // unknown property
+    diags.push({
+      severity: "Warning",
+      message: `Unknown Item property '${rawKey}'`,
+      line: t.line,
+      col: t.col
+    });
+
+    // skip to next ; or } just in case
+    while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+    match("Semicolon");
   }
+
+  expect("RBrace");
+  return { kind: "Item", name: nameTok.value!, baseId, componentTokens: comps, line: nameTok.line, col: nameTok.col };
+}
+
 
   function parseAssignOrCallOrSayRun(): Stmt | null {
     const t = expect("Identifier"); const low = t.value!.toLowerCase();
