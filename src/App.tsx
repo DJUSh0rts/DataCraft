@@ -664,8 +664,12 @@ type VarKind = "string" | "number";
 
 
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
-function localScoreName(ns: string, fn: string, idx: number, name: string) { return `__${fn}_for${idx}_${name}`; }
+function localScoreName(ns: string, fn: string, idx: number, name: string) {
+   void ns;
+   return `__${fn}_for${idx}_${name}`; 
+  }
 function tmpScoreName(idx: number) { return `__tmp${idx}`; }
+
 
 function inferType(expr: Expr, envTypes: Record<string, VarKind | undefined>): VarKind | undefined {
   switch (expr.kind) {
@@ -1045,7 +1049,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       ) {
 
         void outArr;
-        
+
         if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, outArr); return; }
         for (const v of stmt.variants) {
           const parts: string[] = [];
@@ -1109,6 +1113,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         const entryName = `__for_${fn.name}_${loopId}`;
         const stepName  = `__for_${fn.name}_${loopId}__step`;
 
+        void outArr;
         const localScores: Record<string, string> = {};
         const localTypes: Record<string, VarKind> = { ...envTypes };
 
