@@ -627,31 +627,20 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     return { kind: "Item", name: nameTok.value!, baseId, componentTokens: comps, line: nameTok.line, col: nameTok.col };
   }
 
-  function parseStringOrIdentArrayInBrackets(): string[] {
-    const vals: string[] = [];
-    expect("LBracket");
-    while (peek().type !== "RBracket") {
-      const t = peek();
-      if (t.type === "String" || t.type === "Identifier") {
-        pos++;
-        vals.push(t.value ?? "");
-      } else {
-        throw { message: `Expected string or identifier in values[...]`, line: t.line, col: t.col };
-      }
-      match("Comma");
-    }
-    expect("RBracket");
-    return vals;
-  }
-
   function parseTag(): TagDecl {
-  // Accept "BlockTag", "ItemTag", etc.; derive the tag folder from it.
-  const kw = expect("Identifier"); // e.g. BlockTag / ItemTag
-  const kwVal = (kw.value || "");
-  if (!/tag$/i.test(kwVal)) {
+  // Read the keyword: BlockTag / ItemTag / etc.
+  const kw = expect("Identifier");
+  const raw = (kw.value || "");
+  if (!/tag$/i.test(raw)) {
     throw { message: `Expected <Something>Tag (e.g. BlockTag, ItemTag)`, line: kw.line, col: kw.col };
   }
-  const tagType = kwVal.slice(0, -3).toLowerCase(); // "block", "item", ...
+
+  // Derive the tag category folder ("blocks", "items", ...)
+  const base = raw.slice(0, -3).toLowerCase(); // "block", "item", ...
+  let category: TagCategory;
+  if (base === "block") category = "blocks";
+  else if (base === "item") category = "items";
+  else category = (base + "s") as TagCategory; // fallback, though we only use blocks/items for now
 
   const nameTok = expect("Identifier");
   const name = nameTok.value!;
@@ -667,10 +656,8 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   while (peek().type !== "RBrace" && peek().type !== "EOF") {
     const t = expect("Identifier");
     const rawKey = t.value || "";
-    // normalize keys: handle "values:", "values : ", "values:["
-    const key = rawKey.toLowerCase().replace(/[:\[]+$/, "");
+    const key = rawKey.toLowerCase().replace(/[:\[]+$/, ""); // normalize "values:[", "values :", etc.
 
-    // replace = true/false;
     if (key === "replace") {
       if (peek().type === "Equals" || peek().type === "Colon") pos++; // allow "=" or ":"
       const vTok = expect("Identifier", "true/false");
@@ -682,11 +669,8 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     // values: [ "minecraft:stone", "minecraft:air" ];
     if (key === "values") {
       if (peek().type === "Colon") pos++; // optional ":"
-
-      // If "[" was glued to the identifier (e.g., "values:["), don't expect another LBracket.
       const hadBracketInKey = /[:\[]$/.test(rawKey);
       if (!hadBracketInKey) expect("LBracket");
-
       const arr: string[] = [];
       while (peek().type !== "RBracket" && peek().type !== "EOF") {
         const s = expect("String", "tag value string");
@@ -694,7 +678,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
         match("Comma"); // optional comma
       }
       expect("RBracket");
-      match("Semicolon"); // optional trailing semicolon after the array
+      match("Semicolon"); // optional trailing semicolon
       values = arr;
       continue;
     }
@@ -714,14 +698,15 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
   return {
     kind: "Tag",
-    tagType,           // "block", "item", ...
-    name,              // tag file name
-    replace,           // boolean
-    values,            // array of string IDs
+    category,         // <-- matches your TagDecl type
+    name,
+    replace,
+    values,
     line: kw.line,
     col: kw.col,
   };
 }
+
 
 
   function parseAssignOrCallOrSayRun(): Stmt | null {
@@ -748,7 +733,16 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     if (low === "adv") { diags.push({ severity: "Error", message: `adv not allowed inside functions`, line: t.line, col: t.col }); parseAdv(); return null; }
     if (low === "recipe") { diags.push({ severity: "Error", message: `recipe not allowed inside functions`, line: t.line, col: t.col }); parseRecipe(); return null; }
     if (low === "item") { diags.push({ severity: "Error", message: `Item not allowed inside functions`, line: t.line, col: t.col }); parseItem(); return null; }
-    if (low === "blocktag" || low === "itemtag") { diags.push({ severity: "Error", message: `Tag declarations are not allowed inside functions`, line: t.line, col: t.col }); parseTag(low); return null; }
+    if (low === "blocktag" || low === "itemtag") {
+  diags.push({ severity: "Error", message: `Tag declarations are not allowed inside functions`, line: t.line, col: t.col });
+  // Skip the tag block to recover
+  // (we already consumed the keyword; skip name, optional (), and the {...} block)
+  if (peek().type === "Identifier") pos++;                  // name
+  if (match("LParen")) { while (peek().type !== "RParen" && peek().type !== "EOF") pos++; match("RParen"); }
+  if (match("LBrace")) { let d = 1; while (d > 0 && peek().type !== "EOF") { const x = peek(); pos++; if (x.type === "LBrace") d++; else if (x.type === "RBrace") d--; } }
+  return null;
+}
+
 
     const nameTok = t;
     if (peek().type === "PlusPlus" || peek().type === "MinusMinus" ||
@@ -812,7 +806,8 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
         if (low === "adv") { advs.push(parseAdv()); continue; }
         if (low === "recipe") { recipes.push(parseRecipe()); continue; }
         if (low === "item") { items.push(parseItem()); continue; }
-        if (low === "blocktag" || low === "itemtag") { pos++; tags.push(parseTag(low)); continue; }
+        if (low === "blocktag" || low === "itemtag") { tags.push(parseTag()); continue; }
+
       }
       diags.push({ severity: "Error", message: `Unexpected token '${t.value ?? t.type}' in pack`, line: t.line, col: t.col });
       while (peek().type !== "RBrace" && peek().type !== "EOF") pos++;
