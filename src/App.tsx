@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./monaco-setup";
 import JSZip from "jszip";
-import Editor, { useMonaco } from "@monaco-editor/react";
+import Editor, { OnMount, useMonaco } from "@monaco-editor/react";
 import "./basic-dark.css";
 
 /**
@@ -12,7 +12,7 @@ import "./basic-dark.css";
  * - Items + give alias: give.<item>()
  * - Advancements & Recipes (shaped + shapeless) with custom-item result resolution
  * - Tags: BlockTag, ItemTag (replace, values:[...])
- * - VS Code-ish dark UI + IntelliSense + Zip export
+ * - VS Code-ish dark UI + IntelliSense + Monaco markers + File tree + Zip export
  */
 
 // ---------- Types ----------
@@ -628,86 +628,76 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   }
 
   function parseTag(): TagDecl {
-  // Read the keyword: BlockTag / ItemTag / etc.
-  const kw = expect("Identifier");
-  const raw = (kw.value || "");
-  if (!/tag$/i.test(raw)) {
-    throw { message: `Expected <Something>Tag (e.g. BlockTag, ItemTag)`, line: kw.line, col: kw.col };
-  }
-
-  // Derive the tag category folder ("blocks", "items", ...)
-  const base = raw.slice(0, -3).toLowerCase(); // "block", "item", ...
-  let category: TagCategory;
-  if (base === "block") category = "blocks";
-  else if (base === "item") category = "items";
-  else category = (base + "s") as TagCategory; // fallback, though we only use blocks/items for now
-
-  const nameTok = expect("Identifier");
-  const name = nameTok.value!;
-
-  // Optional () like other decls (ignored)
-  if (match("LParen")) expect("RParen");
-
-  expect("LBrace");
-
-  let replace = false;
-  let values: string[] = [];
-
-  while (peek().type !== "RBrace" && peek().type !== "EOF") {
-    const t = expect("Identifier");
-    const rawKey = t.value || "";
-    const key = rawKey.toLowerCase().replace(/[:\[]+$/, ""); // normalize "values:[", "values :", etc.
-
-    if (key === "replace") {
-      if (peek().type === "Equals" || peek().type === "Colon") pos++; // allow "=" or ":"
-      const vTok = expect("Identifier", "true/false");
-      replace = (vTok.value || "").toLowerCase() === "true";
-      match("Semicolon");
-      continue;
+    // Accept "BlockTag", "ItemTag"
+    const kw = expect("Identifier");
+    const kwVal = (kw.value || "");
+    if (!/tag$/i.test(kwVal)) {
+      throw { message: `Expected <Something>Tag (e.g. BlockTag, ItemTag)`, line: kw.line, col: kw.col };
     }
+    const head = kwVal.toLowerCase();
+    const category: TagCategory = head === "blocktag" ? "blocks" : head === "itemtag" ? "items" : "blocks";
 
-    // values: [ "minecraft:stone", "minecraft:air" ];
-    if (key === "values") {
-      if (peek().type === "Colon") pos++; // optional ":"
-      const hadBracketInKey = /[:\[]$/.test(rawKey);
-      if (!hadBracketInKey) expect("LBracket");
-      const arr: string[] = [];
-      while (peek().type !== "RBracket" && peek().type !== "EOF") {
-        const s = expect("String", "tag value string");
-        arr.push(s.value || "");
-        match("Comma"); // optional comma
+    const nameTok = expect("Identifier");
+    const name = nameTok.value!;
+
+    if (match("LParen")) expect("RParen");
+    expect("LBrace");
+
+    let replace = false;
+    let values: string[] = [];
+
+    while (peek().type !== "RBrace" && peek().type !== "EOF") {
+      const t = expect("Identifier");
+      const rawKey = t.value || "";
+      const key = rawKey.toLowerCase().replace(/[:\[]+$/, "");
+
+      if (key === "replace") {
+        if (peek().type === "Equals" || peek().type === "Colon") pos++;
+        const vTok = expect("Identifier", "true/false");
+        replace = (vTok.value || "").toLowerCase() === "true";
+        match("Semicolon");
+        continue;
       }
-      expect("RBracket");
-      match("Semicolon"); // optional trailing semicolon
-      values = arr;
-      continue;
+
+      if (key === "values") {
+        if (peek().type === "Colon") pos++;
+        const hadBracketInKey = /[:\[]$/.test(rawKey);
+        if (!hadBracketInKey) expect("LBracket");
+
+        const arr: string[] = [];
+        while (peek().type !== "RBracket" && peek().type !== "EOF") {
+          const s = expect("String", "tag value string");
+          arr.push(s.value || "");
+          match("Comma");
+        }
+        expect("RBracket");
+        match("Semicolon");
+        values = arr;
+        continue;
+      }
+
+      diags.push({
+        severity: "Warning",
+        message: `Unknown Tag property '${rawKey}'`,
+        line: t.line,
+        col: t.col,
+      });
+      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+      match("Semicolon");
     }
 
-    // Unknown property: warn and skip to next ';' or '}'.
-    diags.push({
-      severity: "Warning",
-      message: `Unknown Tag property '${rawKey}'`,
-      line: t.line,
-      col: t.col,
-    });
-    while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
-    match("Semicolon");
+    expect("RBrace");
+
+    return {
+      kind: "Tag",
+      category,
+      name,
+      replace,
+      values,
+      line: kw.line,
+      col: kw.col,
+    };
   }
-
-  expect("RBrace");
-
-  return {
-    kind: "Tag",
-    category,         // <-- matches your TagDecl type
-    name,
-    replace,
-    values,
-    line: kw.line,
-    col: kw.col,
-  };
-}
-
-
 
   function parseAssignOrCallOrSayRun(): Stmt | null {
     const t = expect("Identifier"); const low = (t.value ?? "").toLowerCase();
@@ -734,15 +724,19 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     if (low === "recipe") { diags.push({ severity: "Error", message: `recipe not allowed inside functions`, line: t.line, col: t.col }); parseRecipe(); return null; }
     if (low === "item") { diags.push({ severity: "Error", message: `Item not allowed inside functions`, line: t.line, col: t.col }); parseItem(); return null; }
     if (low === "blocktag" || low === "itemtag") {
-  diags.push({ severity: "Error", message: `Tag declarations are not allowed inside functions`, line: t.line, col: t.col });
-  // Skip the tag block to recover
-  // (we already consumed the keyword; skip name, optional (), and the {...} block)
-  if (peek().type === "Identifier") pos++;                  // name
-  if (match("LParen")) { while (peek().type !== "RParen" && peek().type !== "EOF") pos++; match("RParen"); }
-  if (match("LBrace")) { let d = 1; while (d > 0 && peek().type !== "EOF") { const x = peek(); pos++; if (x.type === "LBrace") d++; else if (x.type === "RBrace") d--; } }
-  return null;
-}
-
+      diags.push({ severity: "Error", message: `Tag declarations are not allowed inside functions`, line: t.line, col: t.col });
+      // try to skip {...}
+      if (peek().type !== "LBrace") { while (peek().type !== "LBrace" && peek().type !== "EOF") pos++; }
+      if (peek().type === "LBrace") {
+        let depth = 0;
+        do {
+          const tk = peek(); pos++;
+          if (tk.type === "LBrace") depth++;
+          if (tk.type === "RBrace") depth--;
+        } while (depth > 0 && peek().type !== "EOF");
+      }
+      return null;
+    }
 
     const nameTok = t;
     if (peek().type === "PlusPlus" || peek().type === "MinusMinus" ||
@@ -807,7 +801,6 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
         if (low === "recipe") { recipes.push(parseRecipe()); continue; }
         if (low === "item") { items.push(parseItem()); continue; }
         if (low === "blocktag" || low === "itemtag") { tags.push(parseTag()); continue; }
-
       }
       diags.push({ severity: "Error", message: `Unexpected token '${t.value ?? t.type}' in pack`, line: t.line, col: t.col });
       while (peek().type !== "RBrace" && peek().type !== "EOF") pos++;
@@ -830,12 +823,10 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 // ---------- Validation & Helpers ----------
 const PACK_FORMAT = 48;
 
-void PACK_FORMAT;
-
 type VarKind = "string" | "number";
 
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
-function localScoreName(ns: string, fn: string, idx: number, name: string) { void ns; return `__${fn}_for${idx}_${name}`; }
+function localScoreName(_ns: string, fn: string, idx: number, name: string) { return `__${fn}_for${idx}_${name}`; }
 function tmpScoreName(idx: number) { return `__tmp${idx}`; }
 
 function componentTokensToMap(ts?: Token[]): Record<string, any> | undefined {
@@ -1089,8 +1080,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
       void envTypes;
 
-      void outArr;
-
       function leaf(c: CmpCond | RawCond): string[] {
         if ((c as RawCond).kind === "Raw") {
           const cr = c as RawCond;
@@ -1137,9 +1126,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         envTypes: Record<string, VarKind>,
         outArr: string[]
       ) => {
-
-        void outArr;
-        
         const withChain = withChainTo(outArr);
         const makePref = tokensToPref(chain);
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
@@ -1238,7 +1224,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         envTypes: Record<string, VarKind>,
         outArr: string[]
       ) {
-        void outArr;
         if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, outArr); return; }
         for (const v of stmt.variants) {
           const parts: string[] = [];
@@ -1291,10 +1276,11 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       }
 
       function emitFor(
-  stmt: ForStmt,
-  chain: string,
-  envTypes: Record<string, VarKind>
-) {
+        stmt: ForStmt,
+        chain: string,
+        envTypes: Record<string, VarKind>,
+        outArr: string[]
+      ) {
         const withChainParent = withChainTo(fnOut);
         const loopId = forCounter++;
         const entryName = `__for_${fn.name}_${loopId}`;
@@ -1382,9 +1368,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             return;
 
           case "For":
-  emitFor(st, chain, envTypes);
-  return;
-
+            emitFor(st, chain, envTypes, outArr);
+            return;
         }
       }
 
@@ -1507,6 +1492,7 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
     if (!(monaco as any)._dpdslRegistered) {
       monaco.languages.register({ id });
       (monaco as any)._dpdslRegistered = true;
+
       monaco.languages.setMonarchTokensProvider(id, {
         tokenizer: {
           root: [
@@ -1518,6 +1504,15 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
             [/(\&\&)|(\|\|)|==|!=|<=|>=|[+\-*/%]=|[+\-*/%]|[<>]|(\+\+|--)/, "operator"],
           ],
         },
+      });
+
+      monaco.languages.registerDocumentFormattingEditProvider(id, {
+        provideDocumentFormattingEdits: (model) => {
+          const text = model.getValue();
+          // tiny pretty: trim trailing spaces and ensure newline at EOF
+          const pretty = text.replace(/[ \t]+$/gm, "") + (text.endsWith("\n") ? "" : "\n");
+          return [{ range: model.getFullModelRange(), text: pretty }];
+        }
       });
     }
 
@@ -1540,7 +1535,9 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
             "minecraft:damage=",
             "minecraft:unbreakable=",
           ];
-          for (const k of compKeys) suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Property, insertText: k });
+          for (const k of compKeys) {
+            suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Property, insertText: k });
+          }
         }
 
         suggestions.push({
@@ -1625,7 +1622,6 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
           const before = lineText.slice(0, lastDot);
           const packId = (before.split(/[^A-Za-z0-9_.]/).pop() || "").trim();
           if (packId === "give") {
-            // offer item names from all packs in this file (or narrow to current pack only if desired)
             for (const [pid, s] of Object.entries(symbols.packs)) {
               for (const it of Array.from(s.items)) {
                 suggestions.push({ label: it, kind: monaco.languages.CompletionItemKind.Function, insertText: `${it}()`, detail: `give ${pid}:${it}` });
@@ -1651,6 +1647,87 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
 
     return () => disp.dispose();
   }, [monacoRef, symbols]);
+}
+
+// ---------- UI Helpers ----------
+type TreeNode = { name: string; path?: string; children?: Record<string, TreeNode>; isDir: boolean };
+function buildTree(files: GeneratedFile[]): TreeNode {
+  const root: TreeNode = { name: "", isDir: true, children: {} };
+  for (const f of files) {
+    const parts = f.path.split("/");
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const isDir = i < parts.length - 1;
+      const key = part;
+      cur.children = cur.children || {};
+      if (!cur.children[key]) cur.children[key] = { name: part, isDir, children: isDir ? {} : undefined, path: !isDir ? f.path : undefined };
+      cur = cur.children[key]!;
+    }
+  }
+  return root;
+}
+
+function FileTreeNode({
+  node, selected, onSelect
+}: { node: TreeNode; selected?: string; onSelect: (p: string) => void }) {
+  const [open, setOpen] = useState(true);
+  if (!node.isDir) {
+    return (
+      <div className="pl-6">
+        <button
+          onClick={() => node.path && onSelect(node.path)}
+          className={`w-full text-left px-2 py-1 rounded-md text-sm ${selected === node.path ? "bg-neutral-800 border border-neutral-700" : "hover:bg-neutral-800/60"}`}>
+          <span className="mr-2">📄</span><code className="break-all">{node.name}</code>
+        </button>
+      </div>
+    );
+  }
+  const entries = Object.values(node.children || {}).sort((a,b) => (a.isDir === b.isDir) ? a.name.localeCompare(b.name) : (a.isDir ? -1 : 1));
+  return (
+    <div>
+      {node.name !== "" && (
+        <button
+          onClick={() => setOpen(!open)}
+          className="w-full text-left px-2 py-1 rounded-md text-sm hover:bg-neutral-800/60">
+          <span className="mr-2">{open ? "📂" : "📁"}</span><span>{node.name}</span>
+        </button>
+      )}
+      {open && entries.map((child) => (
+        <div key={(child.path || child.name) + Math.random()}>
+          <FileTreeNode node={child} selected={selected} onSelect={onSelect} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function FileTree({
+  files, selected, onSelect
+}: { files: GeneratedFile[]; selected?: string; onSelect: (p: string) => void }) {
+  const tree = useMemo(() => buildTree(files), [files]);
+  return <div className="overflow-auto h-full pr-1"><FileTreeNode node={tree} selected={selected} onSelect={onSelect} /></div>;
+}
+
+function DiagnosticsPanel({ diags }: { diags: Diagnostic[] }) {
+  if (!diags.length) return (
+    <div className="text-sm text-emerald-400 flex items-center gap-2">
+      <span>✓</span> No diagnostics.
+    </div>
+  );
+  return (
+    <div className="space-y-2">
+      {diags.map((d, i) => (
+        <div key={i} className={`rounded-xl p-3 border ${d.severity === "Error" ? "border-red-500/40 bg-red-500/10" : d.severity === "Warning" ? "border-amber-500/40 bg-amber-500/10" : "border-sky-500/40 bg-sky-500/10"} text-neutral-200`}>
+          <div className="flex items-center justify-between">
+            <div className="text-xs uppercase tracking-wide opacity-70">{d.severity}</div>
+            <div className="text-xs opacity-70">Line {d.line}, Col {d.col}</div>
+          </div>
+          <div className="text-sm font-medium mt-1">{d.message}</div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ---------- UI ----------
@@ -1726,45 +1803,7 @@ pack "Items + Recipes + Tags" namespace zombieSpawn{
 }
 `;
 
-function FileList({ files, onSelect, selected }: { files: GeneratedFile[]; selected?: string; onSelect: (p: string) => void }) {
-  const [q, setQ] = useState("");
-  const filtered = useMemo(() => files.filter(f => f.path.toLowerCase().includes(q.toLowerCase())), [files, q]);
-  return (
-    <div className="flex flex-col gap-2 h-full">
-      <input value={q} onChange={e => setQ(e.target.value)} placeholder="Filter files..." className="w-full px-3 py-2 rounded-xl bg-neutral-800/60 border border-neutral-700 text-neutral-200 placeholder:text-neutral-400" />
-      <div className="space-y-1 overflow-auto">
-        {filtered.map(f => (
-          <button key={f.path} onClick={() => onSelect(f.path)} className={`w-full text-left px-3 py-2 rounded-xl border ${selected === f.path ? "border-neutral-600 bg-neutral-800/70" : "border-neutral-800 hover:bg-neutral-800/50"} text-neutral-200`}>
-            <code className="text-sm break-all">{f.path}</code>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function DiagnosticsPanel({ diags }: { diags: Diagnostic[] }) {
-  if (!diags.length) return (
-    <div className="text-sm text-emerald-400 flex items-center gap-2">
-      <span>✓</span> No diagnostics.
-    </div>
-  );
-  return (
-    <div className="space-y-2">
-      {diags.map((d, i) => (
-        <div key={i} className={`rounded-xl p-3 border ${d.severity === "Error" ? "border-red-500/40 bg-red-500/10" : "border-amber-500/40 bg-amber-500/10"} text-neutral-200`}>
-          <div className="flex items-center justify-between">
-            <div className="text-xs uppercase tracking-wide opacity-70">{d.severity}</div>
-            <div className="text-xs opacity-70">Line {d.line}, Col {d.col}</div>
-          </div>
-          <div className="text-sm font-medium mt-1">{d.message}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function useDebounced<T>(value: T, delay = 300) {
+function useDebounced<T>(value: T, delay = 250) {
   const [v, setV] = useState(value);
   const t = useRef<number | null>(null);
   useEffect(() => {
@@ -1777,6 +1816,8 @@ function useDebounced<T>(value: T, delay = 300) {
 
 export default function WebDatapackCompiler() {
   const monaco = useMonaco();
+  const editorRef = useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
+
   const [source, setSource] = useState<string>(DEFAULT_SOURCE);
   const debouncedSource = useDebounced(source, 300);
   const [compiled, setCompiled] = useState<{ files: GeneratedFile[]; diagnostics: Diagnostic[]; symbolIndex: SymbolIndex }>({ files: [], diagnostics: [], symbolIndex: { packs: {} } });
@@ -1784,12 +1825,55 @@ export default function WebDatapackCompiler() {
 
   useDslLanguage(monaco, compiled.symbolIndex);
 
+  // Compile on change
   useEffect(() => {
     const res = compile(debouncedSource);
     setCompiled(res);
     if (res.files.length && !selectedPath) setSelectedPath(res.files[0].path);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedSource]);
+
+  // Push diagnostics to Monaco markers (squigglies + red/yellow dots)
+  useEffect(() => {
+    if (!monaco || !editorRef.current) return;
+    const model = editorRef.current.getModel();
+    if (!model) return;
+
+    const markers = compiled.diagnostics.map(d => ({
+      severity: d.severity === "Error" ? monaco.MarkerSeverity.Error :
+                d.severity === "Warning" ? monaco.MarkerSeverity.Warning :
+                monaco.MarkerSeverity.Info,
+      message: d.message,
+      startLineNumber: Math.max(1, d.line || 1),
+      startColumn: Math.max(1, d.col || 1),
+      endLineNumber: Math.max(1, d.line || 1),
+      endColumn: Math.max(1, (d.col || 1) + 1),
+      source: "DatapackDSL",
+    }));
+    monaco.editor.setModelMarkers(model, "DatapackDSL", markers);
+  }, [compiled.diagnostics, monaco]);
+
+  const onMount: OnMount = (editor, monacoInstance) => {
+    editorRef.current = editor;
+    // pleasant defaults + make errors stand out
+    editor.updateOptions({
+      fontSize: 14,
+      minimap: { enabled: false },
+      wordWrap: "on",
+      automaticLayout: true,
+      fontLigatures: true,
+      renderValidationDecorations: "on",
+      guides: { indentation: true, bracketPairs: true },
+      smoothScrolling: true,
+      scrollBeyondLastLine: false
+    });
+
+    // initial markers
+    const model = editor.getModel();
+    if (model) {
+      monacoInstance.editor.setModelMarkers(model, "DatapackDSL", []);
+    }
+  };
 
   async function downloadZip() {
     if (!compiled.files.length) return;
@@ -1802,6 +1886,7 @@ export default function WebDatapackCompiler() {
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
+  // File selection
   const selectedFile = useMemo(() => compiled.files.find(f => f.path === selectedPath), [compiled.files, selectedPath]);
 
   return (
@@ -1820,16 +1905,18 @@ export default function WebDatapackCompiler() {
           </div>
         </header>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Editor */}
-          <div className="lg:col-span-2 flex flex-col gap-2">
+        {/* Editor + Output */}
+        <div className="grid grid-cols-1 lg:grid-cols-[2fr,1fr] gap-6">
+          {/* Editor + diagnostics */}
+          <div className="flex flex-col gap-2">
             <label className="text-sm font-medium text-neutral-300">Source</label>
-            <div className="rounded-md overflow-hidden border border-neutral-800 shadow-inner">
+            <div className="rounded-xl overflow-hidden border border-neutral-800 shadow-inner">
               <Editor
-                height="560px"
+                height="620px"
                 language="datapackdsl"
                 theme="vs-dark"
                 value={source}
+                onMount={onMount}
                 onChange={(v) => setSource(v ?? "")}
                 options={{
                   fontSize: 14,
@@ -1840,29 +1927,35 @@ export default function WebDatapackCompiler() {
                 }}
               />
             </div>
-            <div>
-              <label className="text-sm font-medium text-neutral-300">Diagnostics</label>
+            <div className="mt-2">
+              <label className="text-sm font-medium text-neutral-300">Problems</label>
               <div className="mt-2"><DiagnosticsPanel diags={compiled.diagnostics} /></div>
             </div>
           </div>
 
-          {/* Output */}
-          <div className="lg:col-span-1 flex flex-col gap-3">
-            <label className="text-sm font-medium text-neutral-300">Generated Files</label>
-            <div className="grid grid-cols-1 gap-3">
-              <div className="border rounded-md p-3 border-neutral-800 bg-neutral-900 h-[240px]">
-                <FileList files={compiled.files} selected={selectedPath} onSelect={setSelectedPath} />
+          {/* File tree + viewer */}
+          <div className="flex flex-col gap-3">
+            <div className="grid grid-rows-[260px,1fr] gap-3">
+              <div className="border rounded-xl p-3 border-neutral-800 bg-neutral-900">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-neutral-300">Generated Files</label>
+                </div>
+                <div className="h-[210px]"><FileTree files={compiled.files} selected={selectedPath} onSelect={setSelectedPath} /></div>
               </div>
-              <div className="border rounded-md p-3 border-neutral-800 bg-neutral-900 h-[300px] overflow-auto">
+
+              <div className="border rounded-xl p-3 border-neutral-800 bg-neutral-900 overflow-auto">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-neutral-300">{selectedPath ?? "No file selected"}</label>
+                </div>
                 {selectedFile ? (
                   <pre className="font-mono text-sm whitespace-pre-wrap break-words text-neutral-200">{selectedFile.contents}</pre>
                 ) : (
-                  <div className="text-sm text-neutral-400">No file selected.</div>
+                  <div className="text-sm text-neutral-400">Select a file from the tree to preview its contents.</div>
                 )}
               </div>
             </div>
 
-            <div className="text-xs text-neutral-400 mt-2 space-y-1">
+            <div className="text-xs text-neutral-400 mt-1 space-y-1">
               <p><b>Items:</b> <code>Item emerald_sword {'{'} base_id = "minecraft:wooden_sword"; components: [ minecraft:item_model="zombieSpawn:emerald_sword" ]; {'}'}</code> → <code>function &lt;ns&gt;:give/emerald_sword</code> or <code>give.emerald_sword()</code></p>
               <p><b>Macros:</b> <code>Say($&quot;Hello {'{'}i{'}'}&quot;)</code>, <code>Run($&quot;summon ~{'{'}x{'}'} ~ ~{'{'}z{'}'}&quot;)</code> — executed with <code>with storage &lt;ns&gt;:variables</code>.</p>
               <p><b>for:</b> <code>for (var i = 0 | i &lt; 10 | i++)</code> or <code>for (num | num &lt; 10 | num++)</code></p>
