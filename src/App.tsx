@@ -86,10 +86,17 @@ type AdvDecl = {
 type RecipeDecl = {
   kind: "Recipe";
   name: string;
-  type?: "shapeless";
-  result?: { id: string; count?: number };
+  type?: "shapeless" | "shaped";
+  // shapeless:
   ingredients: string[];
+  // shaped:
+  pattern?: string[];                 // e.g. [" A ", " B ", " C "]
+  keys?: Record<string, string>;      // e.g. { A: "minecraft:stick" }
+  // result (item id or custom item alias ns.name)
+  result?: { id: string; count?: number };
 };
+
+
 
 // Items
 type ItemDecl = {
@@ -481,28 +488,70 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   }
 
   function parseRecipe(): RecipeDecl {
-    expect("Identifier"); // recipe
-    const nameTok = expect("Identifier"); const name = nameTok.value!;
-    expect("LBrace");
-    const decl: RecipeDecl = { kind: "Recipe", name, ingredients: [], type: "shapeless" };
-    while (peek().type !== "RBrace" && peek().type !== "EOF") {
-      const t = expect("Identifier");
-      const low = t.value!.toLowerCase();
-      if (low === "type") { const v = expect("Identifier").value!; decl.type = v.toLowerCase() === "shapeless" ? "shapeless" : "shapeless"; match("Semicolon"); continue; }
-      if (low === "ingredient") { const id = expect("Identifier").value!; decl.ingredients.push(id); match("Semicolon"); continue; }
-      if (low === "result") {
-        const id = expect("Identifier").value!;
-        let count: number | undefined;
-        if (peek().type === "Number") { count = Number(expect("Number").value!); }
-        decl.result = { id, count }; match("Semicolon"); continue;
-      }
-      diags.push({ severity: "Warning", message: `Unknown recipe property '${t.value}'`, line: t.line, col: t.col });
-      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+  expect("Identifier"); // recipe
+  const nameTok = expect("Identifier"); const name = nameTok.value!;
+  expect("LBrace");
+
+  const decl: RecipeDecl = { kind: "Recipe", name, ingredients: [], type: "shapeless" };
+
+  while (peek().type !== "RBrace" && peek().type !== "EOF") {
+    const t = expect("Identifier");
+    const low = t.value!.toLowerCase();
+
+    if (low === "type") {
+      const v = expect("Identifier").value!;
+      decl.type = v.toLowerCase() === "shaped" ? "shaped" : "shapeless";
       match("Semicolon");
+      continue;
     }
-    expect("RBrace");
-    return decl;
+
+    if (low === "ingredient") {
+      const idTok = expect("Identifier");
+      decl.ingredients.push(idTok.value!);
+      match("Semicolon");
+      continue;
+    }
+
+    if (low === "pattern") {
+  // pattern [ "   ", "   ", "   ", ]
+  const rows = parseStringArrayInBrackets(expect, match, peek);
+  match("Semicolon");
+  decl.type = "shaped";
+  decl.pattern = rows;
+  continue;
+}
+
+if (low === "key") {
+  // key A = minecraft:planks;
+  const ch = expect("Identifier", "single pattern letter").value!;
+  expect("Equals");
+  const idTok = expect("Identifier", "item id");
+  const itemId = idTok.value!;
+  decl.keys = decl.keys ?? {};
+  decl.keys[ch] = itemId;
+  match("Semicolon");
+  continue;
+}
+
+
+    if (low === "result") {
+      const idTok = expect("Identifier");            // vanilla id OR "ns.itemName"
+      let count: number | undefined;
+      if (peek().type === "Number") count = Number(expect("Number").value!);
+      decl.result = { id: idTok.value!, count };
+      match("Semicolon");
+      continue;
+    }
+
+    diags.push({ severity: "Warning", message: `Unknown recipe property '${t.value}'`, line: t.line, col: t.col });
+    while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+    match("Semicolon");
   }
+
+  expect("RBrace");
+  return decl;
+}
+
 
   // Items
   function grabBracketTokenBlock(): Token[] {
@@ -686,6 +735,66 @@ function parseItem(): ItemDecl {
 const PACK_FORMAT = 48;
 type VarKind = "string" | "number";
 
+function componentsTokensToObject(ts?: Token[]): Record<string, any> | undefined {
+  if (!ts || !ts.length) return undefined;
+  const obj: Record<string, any> = {};
+  for (let i = 0; i < ts.length; ) {
+    const t = ts[i];
+    if (t.type === "Comma") { i++; continue; }
+    if (t.type !== "Identifier") { i++; continue; }
+    const key = t.value!;
+    i++;
+    if (ts[i]?.type === "Equals") i++;
+    const v = ts[i];
+    if (!v) break;
+    if (v.type === "String" || v.type === "Identifier") {
+      obj[key] = v.value!;
+    }
+    i++;
+  }
+  return obj;
+}
+
+
+function parseStringArrayInBrackets(expect: (t: TokenType, what?: string) => Token, match: (t: TokenType) => Token | null, peek: (o?: number) => Token): string[] {
+  const rows: string[] = [];
+  expect("LBracket", "'[' after pattern");
+  while (peek().type !== "RBracket") {
+    const s = expect("String", "pattern row as a string");
+    rows.push(s.value ?? "");
+    match("Comma"); // allow trailing commas between rows
+  }
+  expect("RBracket", "']' to close pattern");
+  return rows;
+}
+
+
+function componentTokensToMap(ts?: Token[]): Record<string, any> | undefined {
+  if (!ts || !ts.length) return undefined;
+  const out: Record<string, any> = {};
+  let i = 0;
+  while (i < ts.length) {
+    // expect Identifier (component key)
+    const k = ts[i];
+    if (k.type !== "Identifier") { i++; continue; }
+    i++;
+    // expect Equals
+    if (i < ts.length && ts[i].type === "Equals") i++;
+    // expect value (String or Identifier)
+    if (i < ts.length) {
+      const v = ts[i];
+      if (v.type === "String" || v.type === "Identifier" || v.type === "Number") {
+        out[k.value!] = v.value;
+        i++;
+      }
+    }
+    // optional comma
+    if (i < ts.length && ts[i].type === "Comma") i++;
+  }
+  return out;
+}
+
+
 
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
 function localScoreName(ns: string, fn: string, idx: number, name: string) {
@@ -836,7 +945,19 @@ function tokensToText(ts: Token[]): string {
   return out;
 }
 
+
 function validate(ast: Script): Diagnostic[] {
+
+  // before the per-pack generation loop, build an item index
+const itemIndex: Record<string, Record<string, ItemDecl>> = {};
+for (const pack of ast.packs) {
+  itemIndex[pack.namespace] = {};
+  for (const it of pack.items) {
+    itemIndex[pack.namespace][it.name.toLowerCase()] = it;
+  }
+}
+
+
   const diags: Diagnostic[] = [];
   const nsSet = new Set<string>();
   for (const p of ast.packs) {
@@ -849,6 +970,7 @@ function validate(ast: Script): Diagnostic[] {
   }
   return diags;
 }
+
 
 // ---------- Generation ----------
 function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnostic[]; symbolIndex: SymbolIndex } {
@@ -1246,19 +1368,67 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       files.push({ path: `data/${p.namespace}/advancements/${n}.json`, contents: JSON.stringify(advJson, null, 2) + "\n" });
     }
 
-    // Recipes (shapeless)
-    for (const r of p.recipes) {
-      const n = r.name.toLowerCase();
-      const type = r.type === "shapeless" ? "minecraft:crafting_shapeless" : "minecraft:crafting_shapeless";
-      const ingredients = r.ingredients.map(id => ({ item: id }));
-      const result = r.result ?? { id: "minecraft:stone", count: 1 };
-      const json = {
-        type,
-        ingredients,
-        result: { id: result.id, count: result.count ?? 1 }
-      };
-      files.push({ path: `data/${p.namespace}/recipes/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
+    // --- Recipes (shapeless + shaped, with custom-item result) ---
+for (const p of ast.packs) {
+  // Prepare a lookup of custom items by "<ns>.<name>"
+  const itemLookup: Record<string, { baseId: string; comps?: Record<string, any> }> = {};
+  for (const it of p.items) {
+    itemLookup[`${p.namespace}.${it.name}`] = {
+      baseId: it.baseId,
+      comps: componentTokensToMap(it.componentTokens)
+    };
+  }
+
+  for (const r of p.recipes) {
+    const n = r.name.toLowerCase();
+
+    // Resolve result
+    let resId = (r.result?.id ?? "minecraft:stone");
+    let resCount = r.result?.count ?? 1;
+    let resComponents: Record<string, any> | undefined;
+
+    // If "ns.itemName", pull from itemLookup
+    if (!resId.includes(":") && resId.includes(".")) {
+      const hit = itemLookup[resId];
+      if (hit) {
+        resComponents = hit.comps;
+        resId = hit.baseId;
+      } else {
+        diagnostics.push({
+          severity: "Warning",
+          message: `Result '${resId}' not found as custom Item in namespace '${p.namespace}'. Falling back to literal.`,
+          line: 1, col: 1
+        });
+      }
     }
+
+    if ((r.type ?? "shapeless") === "shaped") {
+      const type = "minecraft:crafting_shaped";
+      const pattern = r.pattern && r.pattern.length ? r.pattern : ["###"];
+      const key: Record<string, any> = {};
+      for (const [ch, id] of Object.entries(r.keys ?? {})) {
+        key[ch] = { item: id };
+      }
+      const result: any = { id: resId, count: resCount };
+      if (resComponents && Object.keys(resComponents).length) {
+        result.components = resComponents;
+      }
+      const json = { type, pattern, key, result };
+      files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
+    } else {
+      // shapeless (existing behavior)
+      const type = "minecraft:crafting_shapeless";
+      const ingredients = (r.ingredients ?? []).map(id => ({ item: id }));
+      const result: any = { id: resId, count: resCount };
+      if (resComponents && Object.keys(resComponents).length) {
+        result.components = resComponents;
+      }
+      const json = { type, ingredients, result };
+      files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
+    }
+  }
+}
+
 
     // Items -> give functions
     for (const it of p.items) {
