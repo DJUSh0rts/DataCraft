@@ -10,8 +10,9 @@ import "./basic-dark.css";
  * - Execute blocks, Say/Run (with macro strings $"...")
  * - Globals (strings -> storage <ns>:variables, numbers -> scoreboard "vars")
  * - Items + give alias: give.<item>()
- * - Advancements & Recipes
- * - VS Code-ish dark UI + IntelliSense
+ * - Advancements & Recipes (shaped + shapeless) with custom-item result resolution
+ * - Tags: BlockTag, ItemTag (replace, values:[...])
+ * - VS Code-ish dark UI + IntelliSense + Zip export
  */
 
 // ---------- Types ----------
@@ -33,15 +34,15 @@ type Diagnostic = { severity: "Error" | "Warning" | "Info"; message: string; lin
 // Expressions
 type StringExpr = { kind: "String"; value: string; line: number; col: number };
 type NumberExpr = { kind: "Number"; value: number; line: number; col: number };
-type VarExpr = { kind: "Var"; name: string; line: number; col: number };
-type BinaryExpr = { kind: "Binary"; op: "+" | "-" | "*" | "/" | "%"; left: Expr; right: Expr; line: number; col: number };
+type VarExpr   = { kind: "Var"; name: string; line: number; col: number };
+type BinaryExpr= { kind: "Binary"; op: "+" | "-" | "*" | "/" | "%"; left: Expr; right: Expr; line: number; col: number };
 type Expr = StringExpr | NumberExpr | VarExpr | BinaryExpr;
 
 // Conditions
 type CmpOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
 type RawCond = { kind: "Raw"; raw: string; line: number; col: number };
 type CmpCond = { kind: "Cmp"; op: CmpOp; left: Expr; right: Expr; line: number; col: number };
-type BoolCond = { kind: "Bool"; op: "&&" | "||"; left: Condition; right: Condition; line: number; col: number };
+type BoolCond= { kind: "Bool"; op: "&&" | "||"; left: Condition; right: Condition; line: number; col: number };
 type Condition = RawCond | CmpCond | BoolCond;
 
 // Execute helpers
@@ -83,6 +84,7 @@ type AdvDecl = {
   name: string;
   props: { title?: string; description?: string; icon?: string; parent?: string; criteria: Array<{ name: string; trigger: string }> };
 };
+
 type RecipeDecl = {
   kind: "Recipe";
   name: string;
@@ -90,13 +92,11 @@ type RecipeDecl = {
   // shapeless:
   ingredients: string[];
   // shaped:
-  pattern?: string[];                 // e.g. [" A ", " B ", " C "]
-  keys?: Record<string, string>;      // e.g. { A: "minecraft:stick" }
-  // result (item id or custom item alias ns.name)
+  pattern?: string[];            // [" A ", " B ", " C "]
+  keys?: Record<string, string>; // { A: "minecraft:stick" }
+  // result: vanilla id or custom item alias ns.name
   result?: { id: string; count?: number };
 };
-
-
 
 // Items
 type ItemDecl = {
@@ -104,6 +104,17 @@ type ItemDecl = {
   name: string;
   baseId: string;
   componentTokens?: Token[];
+  line: number; col: number;
+};
+
+// Tags
+type TagCategory = "blocks" | "items";
+type TagDecl = {
+  kind: "Tag";
+  category: TagCategory;
+  name: string;
+  replace: boolean;
+  values: string[];
   line: number; col: number;
 };
 
@@ -118,11 +129,12 @@ type PackDecl = {
   advs: AdvDecl[];
   recipes: RecipeDecl[];
   items: ItemDecl[];
+  tags: TagDecl[];
 };
 type Script = { packs: PackDecl[] };
 
 type GeneratedFile = { path: string; contents: string };
-type SymbolIndex = { packs: Record<string, { title: string; vars: Set<string>; funcs: Set<string> }> };
+type SymbolIndex = { packs: Record<string, { title: string; vars: Set<string>; funcs: Set<string>; items: Set<string> }> };
 
 // ---------- Lexer ----------
 function lex(input: string): Token[] {
@@ -317,7 +329,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
   function parseVarDecl(isGlobalForced = false): VarDeclStmt {
     const first = expect("Identifier");
-    const low = first.value!.toLowerCase();
+    const low = (first.value ?? "").toLowerCase();
     if (low !== "var" && low !== "let") throw { message: `Expected 'var' or 'let'`, line: first.line, col: first.col };
     const name = expect("Identifier").value!;
     expect("Equals");
@@ -345,7 +357,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
   function parseIfUnless(): IfBlock {
     const kw = expect("Identifier");
-    const low = kw.value!.toLowerCase();
+    const low = (kw.value ?? "").toLowerCase();
     const neg = (low === "unless");
     if (!neg && low !== "if") throw { message: "Expected 'if' or 'unless'", line: kw.line, col: kw.col };
 
@@ -362,11 +374,10 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     // Optional else / else if
     let elseBranch: IfBlock | ElseBlock | null = null;
     if (peek().type === "Identifier" && (peek().value?.toLowerCase() === "else")) {
-      pos++; // consume 'else'
+      pos++; // 'else'
       if (peek().type === "Identifier" && (peek().value?.toLowerCase() === "if" || peek().value?.toLowerCase() === "unless")) {
         elseBranch = parseIfUnless(); // else if / else unless
       } else {
-        // else { ... }
         expect("LBrace");
         const eb: Stmt[] = [];
         while (peek().type !== "RBrace" && peek().type !== "EOF") { const s = parseStmt(); if (s) eb.push(s); }
@@ -379,7 +390,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   }
 
   function parseExecute(): ExecuteStmt {
-    const kw = expect("Identifier"); if (kw.value!.toLowerCase() !== "execute") throw { message: `Expected 'Execute'`, line: kw.line, col: kw.col };
+    const kw = expect("Identifier"); if ((kw.value ?? "").toLowerCase() !== "execute") throw { message: `Expected 'Execute'`, line: kw.line, col: kw.col };
     expect("LParen");
     const variants: ExecVariant[] = [];
     let current: ExecVariant = { mods: [] };
@@ -387,7 +398,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
     while (peek().type !== "RParen" && peek().type !== "EOF") {
       const t = expect("Identifier");
-      const low = t.value!.toLowerCase();
+      const low = (t.value ?? "").toLowerCase();
       if (low === "or") { pushCurrent(); if (peek().type === "Comma") match("Comma"); continue; }
       if (low === "as") { const target = expect("Identifier").value!; current.mods.push({ kind: "as", arg: target }); }
       else if (low === "at") { const target = expect("Identifier").value!; current.mods.push({ kind: "at", arg: target }); }
@@ -420,7 +431,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     let init: VarDeclStmt | AssignStmt | { kind: "Noop" } | null = null;
     if (peek().type !== "Pipe") {
       const t = peek();
-      if (t.type === "Identifier" && (t.value?.toLowerCase() === "var" || t.value?.toLowerCase() === "let")) {
+      if (t.type === "Identifier" && ((t.value ?? "").toLowerCase() === "var" || (t.value ?? "").toLowerCase() === "let")) {
         const d = parseVarDecl(false); init = d;
       } else if (t.type === "Identifier") {
         const nameTok = expect("Identifier");
@@ -467,17 +478,15 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     const props: AdvDecl["props"] = { criteria: [] };
     while (peek().type !== "RBrace" && peek().type !== "EOF") {
       const t = expect("Identifier");
-      const low = t.value!.toLowerCase();
+      const low = (t.value ?? "").toLowerCase();
       if (low === "title") { const s = expect("String"); props.title = s.value!; match("Semicolon"); continue; }
       if (low === "description" || low === "desc") { const s = expect("String"); props.description = s.value!; match("Semicolon"); continue; }
       if (low === "icon") { const s = expect("Identifier"); props.icon = s.value!; match("Semicolon"); continue; }
       if (low === "parent") { const s = expect("Identifier"); props.parent = s.value!; match("Semicolon"); continue; }
       if (low === "criterion") {
         const cname = expect("Identifier").value!;
-        thead: {
-          const trig = expect("String").value!;
-          props.criteria.push({ name: cname, trigger: trig }); match("Semicolon"); continue;
-        }
+        const trig = expect("String").value!;
+        props.criteria.push({ name: cname, trigger: trig }); match("Semicolon"); continue;
       }
       diags.push({ severity: "Warning", message: `Unknown adv property '${t.value}'`, line: t.line, col: t.col });
       while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
@@ -487,73 +496,80 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     return { kind: "Adv", name, props };
   }
 
-  function parseRecipe(): RecipeDecl {
-  expect("Identifier"); // recipe
-  const nameTok = expect("Identifier"); const name = nameTok.value!;
-  expect("LBrace");
-
-  const decl: RecipeDecl = { kind: "Recipe", name, ingredients: [], type: "shapeless" };
-
-  while (peek().type !== "RBrace" && peek().type !== "EOF") {
-    const t = expect("Identifier");
-    const low = t.value!.toLowerCase();
-
-    if (low === "type") {
-      const v = expect("Identifier").value!;
-      decl.type = v.toLowerCase() === "shaped" ? "shaped" : "shapeless";
-      match("Semicolon");
-      continue;
+  function parseStringArrayInBrackets(expectFn: (t: TokenType, what?: string) => Token, matchFn: (t: TokenType) => Token | null, peekFn: (o?: number) => Token): string[] {
+    const rows: string[] = [];
+    expectFn("LBracket", "'[' after pattern");
+    while (peekFn().type !== "RBracket") {
+      const s = expectFn("String", "pattern row as a string");
+      rows.push(s.value ?? "");
+      matchFn("Comma");
     }
-
-    if (low === "ingredient") {
-      const idTok = expect("Identifier");
-      decl.ingredients.push(idTok.value!);
-      match("Semicolon");
-      continue;
-    }
-
-    if (low === "pattern") {
-  // pattern [ "   ", "   ", "   ", ]
-  const rows = parseStringArrayInBrackets(expect, match, peek);
-  match("Semicolon");
-  decl.type = "shaped";
-  decl.pattern = rows;
-  continue;
-}
-
-if (low === "key") {
-  // key A = minecraft:planks;
-  const ch = expect("Identifier", "single pattern letter").value!;
-  expect("Equals");
-  const idTok = expect("Identifier", "item id");
-  const itemId = idTok.value!;
-  decl.keys = decl.keys ?? {};
-  decl.keys[ch] = itemId;
-  match("Semicolon");
-  continue;
-}
-
-
-    if (low === "result") {
-      const idTok = expect("Identifier");            // vanilla id OR "ns.itemName"
-      let count: number | undefined;
-      if (peek().type === "Number") count = Number(expect("Number").value!);
-      decl.result = { id: idTok.value!, count };
-      match("Semicolon");
-      continue;
-    }
-
-    diags.push({ severity: "Warning", message: `Unknown recipe property '${t.value}'`, line: t.line, col: t.col });
-    while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
-    match("Semicolon");
+    expectFn("RBracket", "']' to close pattern");
+    return rows;
   }
 
-  expect("RBrace");
-  return decl;
-}
+  function parseRecipe(): RecipeDecl {
+    expect("Identifier"); // recipe
+    const nameTok = expect("Identifier"); const name = nameTok.value!;
+    expect("LBrace");
 
+    const decl: RecipeDecl = { kind: "Recipe", name, ingredients: [], type: "shapeless" };
 
-  // Items
+    while (peek().type !== "RBrace" && peek().type !== "EOF") {
+      const t = expect("Identifier");
+      const low = (t.value ?? "").toLowerCase();
+
+      if (low === "type") {
+        const v = expect("Identifier").value!;
+        decl.type = v.toLowerCase() === "shaped" ? "shaped" : "shapeless";
+        match("Semicolon");
+        continue;
+      }
+
+      if (low === "ingredient") {
+        const idTok = expect("Identifier");
+        decl.ingredients.push(idTok.value!);
+        match("Semicolon");
+        continue;
+      }
+
+      if (low === "pattern") {
+        const rows = parseStringArrayInBrackets(expect, match, peek);
+        match("Semicolon");
+        decl.type = "shaped";
+        decl.pattern = rows;
+        continue;
+      }
+
+      if (low === "key") {
+        const ch = expect("Identifier", "single pattern letter").value!;
+        expect("Equals");
+        const idTok = expect("Identifier", "item id");
+        const itemId = idTok.value!;
+        decl.keys = decl.keys ?? {};
+        decl.keys[ch] = itemId;
+        match("Semicolon");
+        continue;
+      }
+
+      if (low === "result") {
+        const idTok = expect("Identifier"); // vanilla id OR "ns.item"
+        let count: number | undefined;
+        if (peek().type === "Number") count = Number(expect("Number").value!);
+        decl.result = { id: idTok.value!, count };
+        match("Semicolon");
+        continue;
+      }
+
+      diags.push({ severity: "Warning", message: `Unknown recipe property '${t.value}'`, line: t.line, col: t.col });
+      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+      match("Semicolon");
+    }
+
+    expect("RBrace");
+    return decl;
+  }
+
   function grabBracketTokenBlock(): Token[] {
     expect("LBracket");
     const collected: Token[] = [];
@@ -569,70 +585,117 @@ if (low === "key") {
     return collected;
   }
 
-  // --- replace your parseItem() with this ---
-function parseItem(): ItemDecl {
-  expect("Identifier"); // Item
-  const nameTok = expect("Identifier");
-  if (match("LParen")) expect("RParen");
-  expect("LBrace");
+  function parseItem(): ItemDecl {
+    expect("Identifier"); // Item
+    const nameTok = expect("Identifier");
+    if (match("LParen")) expect("RParen");
+    expect("LBrace");
 
-  let baseId = "minecraft:stone";
-  let comps: Token[] | undefined;
+    let baseId = "minecraft:stone";
+    let comps: Token[] | undefined;
 
-  while (peek().type !== "RBrace" && peek().type !== "EOF") {
-    // read the raw key (could be "components" or "components:")
-    const t = expect("Identifier");
-    const rawKey = t.value || "";
-    const key = rawKey.toLowerCase().replace(/:$/, ""); // <- allow a trailing colon in the key
+    while (peek().type !== "RBrace" && peek().type !== "EOF") {
+      const t = expect("Identifier");
+      const rawKey = t.value || "";
+      const key = rawKey.toLowerCase().replace(/:$/, "");
 
-    if (key === "base_id") {
-      // allow either "base_id =" or "base_id :" (we still prefer "=")
-      if (peek().type === "Equals" || peek().type === "Colon") pos++;
-      const v = peek();
-      if (v.type === "String" || v.type === "Identifier") {
-        pos++;
-        baseId = String(v.value ?? "");
-      } else {
-        throw { message: `base_id must be string or identifier`, line: v.line, col: v.col };
+      if (key === "base_id") {
+        if (peek().type === "Equals" || peek().type === "Colon") pos++;
+        const v = peek();
+        if (v.type === "String" || v.type === "Identifier") {
+          pos++;
+          baseId = String(v.value ?? "");
+        } else {
+          throw { message: `base_id must be string or identifier`, line: v.line, col: v.col };
+        }
+        match("Semicolon");
+        continue;
       }
+
+      if (key === "components") {
+        if (peek().type === "Colon") pos++;
+        comps = grabBracketTokenBlock();
+        match("Semicolon");
+        continue;
+      }
+
+      diags.push({ severity: "Warning", message: `Unknown Item property '${t.value}'`, line: t.line, col: t.col });
+      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
       match("Semicolon");
-      continue;
     }
-
-    if (key === "components") {
-      // accept "components:" or "components :" or even "components" then a bracket
-      if (peek().type === "Colon") pos++; // consume optional colon
-      comps = grabBracketTokenBlock();    // collects everything inside [...]
-      match("Semicolon");
-      continue;
-    }
-
-    // unknown property
-    diags.push({
-      severity: "Warning",
-      message: `Unknown Item property '${rawKey}'`,
-      line: t.line,
-      col: t.col
-    });
-
-    // skip to next ; or } just in case
-    while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
-    match("Semicolon");
+    expect("RBrace");
+    return { kind: "Item", name: nameTok.value!, baseId, componentTokens: comps, line: nameTok.line, col: nameTok.col };
   }
 
-  expect("RBrace");
-  return { kind: "Item", name: nameTok.value!, baseId, componentTokens: comps, line: nameTok.line, col: nameTok.col };
-}
+  function parseStringOrIdentArrayInBrackets(): string[] {
+    const vals: string[] = [];
+    expect("LBracket");
+    while (peek().type !== "RBracket") {
+      const t = peek();
+      if (t.type === "String" || t.type === "Identifier") {
+        pos++;
+        vals.push(t.value ?? "");
+      } else {
+        throw { message: `Expected string or identifier in values[...]`, line: t.line, col: t.col };
+      }
+      match("Comma");
+    }
+    expect("RBracket");
+    return vals;
+  }
 
+  function parseTag(kindLow: string): TagDecl {
+    const nameTok = expect("Identifier");
+    const name = nameTok.value!;
+    expect("LBrace");
+
+    let replace = false;
+    let values: string[] = [];
+
+    while (peek().type !== "RBrace" && peek().type !== "EOF") {
+      const t = expect("Identifier");
+      const key = (t.value ?? "").toLowerCase();
+
+      if (key === "replace") {
+        if (peek().type === "Equals" || peek().type === "Colon") pos++;
+        const b = expect("Identifier");
+        const bl = (b.value ?? "").toLowerCase();
+        if (bl !== "true" && bl !== "false") {
+          throw { message: `replace must be true or false`, line: b.line, col: b.col };
+        }
+        replace = (bl === "true");
+        match("Semicolon");
+        continue;
+      }
+
+      if (key === "values") {
+        if (peek().type === "Colon") pos++;
+        values = parseStringOrIdentArrayInBrackets();
+        match("Semicolon");
+        continue;
+      }
+
+      diags.push({ severity: "Warning", message: `Unknown Tag property '${t.value}'`, line: t.line, col: t.col });
+      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+      match("Semicolon");
+    }
+
+    expect("RBrace");
+
+    const category: TagCategory =
+      kindLow === "blocktag" ? "blocks" : "items";
+
+    return { kind: "Tag", category, name, replace, values, line: nameTok.line, col: nameTok.col };
+  }
 
   function parseAssignOrCallOrSayRun(): Stmt | null {
-    const t = expect("Identifier"); const low = t.value!.toLowerCase();
+    const t = expect("Identifier"); const low = (t.value ?? "").toLowerCase();
     if (low === "run") { expect("LParen"); const expr = parseExpr(); expect("RParen"); match("Semicolon"); return { kind: "Run", expr }; }
     if (low === "say") { expect("LParen"); const expr = parseExpr(); expect("RParen"); match("Semicolon"); return { kind: "Say", expr }; }
 
     if (low === "global") {
       const nxt = peek();
-      if (nxt.type === "Identifier" && (nxt.value?.toLowerCase() === "var" || nxt.value?.toLowerCase() === "let")) {
+      if (nxt.type === "Identifier" && ((nxt.value ?? "").toLowerCase() === "var" || (nxt.value ?? "").toLowerCase() === "let")) {
         pos++; const d = parseVarDecl(true); return d;
       }
       diags.push({ severity: "Error", message: `Expected 'var' after 'global'`, line: t.line, col: t.col });
@@ -645,10 +708,11 @@ function parseItem(): ItemDecl {
       return d;
     }
 
-    // these are NOT allowed in function scope; consume to recover
+    // not allowed in function scope; recover
     if (low === "adv") { diags.push({ severity: "Error", message: `adv not allowed inside functions`, line: t.line, col: t.col }); parseAdv(); return null; }
     if (low === "recipe") { diags.push({ severity: "Error", message: `recipe not allowed inside functions`, line: t.line, col: t.col }); parseRecipe(); return null; }
     if (low === "item") { diags.push({ severity: "Error", message: `Item not allowed inside functions`, line: t.line, col: t.col }); parseItem(); return null; }
+    if (low === "blocktag" || low === "itemtag") { diags.push({ severity: "Error", message: `Tag declarations are not allowed inside functions`, line: t.line, col: t.col }); parseTag(low); return null; }
 
     const nameTok = t;
     if (peek().type === "PlusPlus" || peek().type === "MinusMinus" ||
@@ -669,11 +733,11 @@ function parseItem(): ItemDecl {
   function parseStmt(): Stmt | null {
     const t = peek();
     if (t.type === "Identifier") {
-      const low = t.value!.toLowerCase();
+      const low = (t.value ?? "").toLowerCase();
       if (low === "execute") return parseExecute();
       if (low === "if" || low === "unless") return parseIfUnless();
       if (low === "for") return parseFor();
-      if (low === "adv" || low === "recipe" || low === "item") return parseAssignOrCallOrSayRun();
+      if (low === "adv" || low === "recipe" || low === "item" || low === "blocktag" || low === "itemtag") return parseAssignOrCallOrSayRun();
       return parseAssignOrCallOrSayRun();
     }
     if (t.type === "RBrace") return null;
@@ -701,24 +765,25 @@ function parseItem(): ItemDecl {
     const nsTok = expect("Identifier"); const nsOriginal = nsTok.value!; const nsLower = nsOriginal.toLowerCase();
     expect("LBrace");
 
-    const globals: VarDeclStmt[] = []; const funcs: FuncDecl[] = []; const advs: AdvDecl[] = []; const recipes: RecipeDecl[] = []; const items: ItemDecl[] = [];
+    const globals: VarDeclStmt[] = []; const funcs: FuncDecl[] = []; const advs: AdvDecl[] = []; const recipes: RecipeDecl[] = []; const items: ItemDecl[] = []; const tags: TagDecl[] = [];
     while (peek().type !== "RBrace" && peek().type !== "EOF") {
       const t = peek();
       if (t.type === "Identifier") {
-        const low = t.value!.toLowerCase();
+        const low = (t.value ?? "").toLowerCase();
         if (low === "global") { pos++; const decl = parseVarDecl(true); globals.push(decl); continue; }
         if (low === "var" || low === "let") { const decl = parseVarDecl(true); globals.push(decl); continue; }
         if (low === "func") { funcs.push(parseFunc()); continue; }
         if (low === "adv") { advs.push(parseAdv()); continue; }
         if (low === "recipe") { recipes.push(parseRecipe()); continue; }
         if (low === "item") { items.push(parseItem()); continue; }
+        if (low === "blocktag" || low === "itemtag") { pos++; tags.push(parseTag(low)); continue; }
       }
       diags.push({ severity: "Error", message: `Unexpected token '${t.value ?? t.type}' in pack`, line: t.line, col: t.col });
       while (peek().type !== "RBrace" && peek().type !== "EOF") pos++;
     }
 
     expect("RBrace");
-    return { packTitle: nameTok.value!, namespace: nsLower, namespaceOriginal: nsOriginal, globals, functions: funcs, advs, recipes, items };
+    return { packTitle: nameTok.value!, namespace: nsLower, namespaceOriginal: nsOriginal, globals, functions: funcs, advs, recipes, items, tags };
   }
 
   const packs: PackDecl[] = [];
@@ -735,52 +800,19 @@ function parseItem(): ItemDecl {
 const PACK_FORMAT = 48;
 type VarKind = "string" | "number";
 
-function componentsTokensToObject(ts?: Token[]): Record<string, any> | undefined {
-  if (!ts || !ts.length) return undefined;
-  const obj: Record<string, any> = {};
-  for (let i = 0; i < ts.length; ) {
-    const t = ts[i];
-    if (t.type === "Comma") { i++; continue; }
-    if (t.type !== "Identifier") { i++; continue; }
-    const key = t.value!;
-    i++;
-    if (ts[i]?.type === "Equals") i++;
-    const v = ts[i];
-    if (!v) break;
-    if (v.type === "String" || v.type === "Identifier") {
-      obj[key] = v.value!;
-    }
-    i++;
-  }
-  return obj;
-}
-
-
-function parseStringArrayInBrackets(expect: (t: TokenType, what?: string) => Token, match: (t: TokenType) => Token | null, peek: (o?: number) => Token): string[] {
-  const rows: string[] = [];
-  expect("LBracket", "'[' after pattern");
-  while (peek().type !== "RBracket") {
-    const s = expect("String", "pattern row as a string");
-    rows.push(s.value ?? "");
-    match("Comma"); // allow trailing commas between rows
-  }
-  expect("RBracket", "']' to close pattern");
-  return rows;
-}
-
+function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
+function localScoreName(ns: string, fn: string, idx: number, name: string) { void ns; return `__${fn}_for${idx}_${name}`; }
+function tmpScoreName(idx: number) { return `__tmp${idx}`; }
 
 function componentTokensToMap(ts?: Token[]): Record<string, any> | undefined {
   if (!ts || !ts.length) return undefined;
   const out: Record<string, any> = {};
   let i = 0;
   while (i < ts.length) {
-    // expect Identifier (component key)
     const k = ts[i];
     if (k.type !== "Identifier") { i++; continue; }
     i++;
-    // expect Equals
     if (i < ts.length && ts[i].type === "Equals") i++;
-    // expect value (String or Identifier)
     if (i < ts.length) {
       const v = ts[i];
       if (v.type === "String" || v.type === "Identifier" || v.type === "Number") {
@@ -788,21 +820,30 @@ function componentTokensToMap(ts?: Token[]): Record<string, any> | undefined {
         i++;
       }
     }
-    // optional comma
     if (i < ts.length && ts[i].type === "Comma") i++;
   }
   return out;
 }
 
-
-
-function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
-function localScoreName(ns: string, fn: string, idx: number, name: string) {
-   void ns;
-   return `__${fn}_for${idx}_${name}`; 
+function tokensToText(ts: Token[]): string {
+  let out = "";
+  for (const t of ts) {
+    switch (t.type) {
+      case "String": out += JSON.stringify(t.value ?? ""); break;
+      case "Identifier":
+      case "Number": out += t.value ?? ""; break;
+      case "Comma": out += ", "; break;
+      case "Colon": out += ":"; break;
+      case "Equals": out += "="; break;
+      case "LBrace": out += "{"; break;
+      case "RBrace": out += "}"; break;
+      case "LBracket": out += "["; break;
+      case "RBracket": out += "]"; break;
+      default: out += "";
+    }
   }
-function tmpScoreName(idx: number) { return `__tmp${idx}`; }
-
+  return out;
+}
 
 function inferType(expr: Expr, envTypes: Record<string, VarKind | undefined>): VarKind | undefined {
   switch (expr.kind) {
@@ -879,7 +920,6 @@ function compileNumericExpr(
   return res;
 }
 
-// macro helpers
 function renderMacroTemplate(src: string): { line: string; refs: string[] } {
   const refs: string[] = [];
   const line = src.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, g1) => {
@@ -900,8 +940,6 @@ function exprToTellrawComponents(
 ): { comps: any[], ok: boolean } {
   const parts: any[] = [];
   let ok = true;
-
-  void ns;
 
   function pushExpr(e: Expr) {
     switch (e.kind) {
@@ -925,39 +963,7 @@ function exprToTellrawComponents(
   return { comps: parts, ok };
 }
 
-function tokensToText(ts: Token[]): string {
-  let out = "";
-  for (const t of ts) {
-    switch (t.type) {
-      case "String": out += JSON.stringify(t.value ?? ""); break;
-      case "Identifier":
-      case "Number": out += t.value ?? ""; break;
-      case "Comma": out += ", "; break;
-      case "Colon": out += ":"; break;
-      case "Equals": out += "="; break;
-      case "LBrace": out += "{"; break;
-      case "RBrace": out += "}"; break;
-      case "LBracket": out += "["; break;
-      case "RBracket": out += "]"; break;
-      default: out += "";
-    }
-  }
-  return out;
-}
-
-
 function validate(ast: Script): Diagnostic[] {
-
-  // before the per-pack generation loop, build an item index
-const itemIndex: Record<string, Record<string, ItemDecl>> = {};
-for (const pack of ast.packs) {
-  itemIndex[pack.namespace] = {};
-  for (const it of pack.items) {
-    itemIndex[pack.namespace][it.name.toLowerCase()] = it;
-  }
-}
-
-
   const diags: Diagnostic[] = [];
   const nsSet = new Set<string>();
   for (const p of ast.packs) {
@@ -971,18 +977,19 @@ for (const pack of ast.packs) {
   return diags;
 }
 
-
 // ---------- Generation ----------
+const PACK_FORMAT_CONST = 48;
+
 function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnostic[]; symbolIndex: SymbolIndex } {
   const diagnostics: Diagnostic[] = [];
   const files: GeneratedFile[] = [];
 
   const description = ast.packs[0]?.packTitle ?? "Datapack";
-  files.push({ path: `pack.mcmeta`, contents: JSON.stringify({ pack: { pack_format: PACK_FORMAT, description } }, null, 2) + "\n" });
+  files.push({ path: `pack.mcmeta`, contents: JSON.stringify({ pack: { pack_format: PACK_FORMAT_CONST, description } }, null, 2) + "\n" });
 
   const symbolIndex: SymbolIndex = { packs: {} };
   for (const p of ast.packs) {
-    symbolIndex.packs[p.namespace] = { title: p.packTitle, vars: new Set(p.globals.map(g => g.name)), funcs: new Set(p.functions.map(f => f.name)) };
+    symbolIndex.packs[p.namespace] = { title: p.packTitle, vars: new Set(p.globals.map(g => g.name)), funcs: new Set(p.functions.map(f => f.name)), items: new Set(p.items.map(i => i.name)) };
   }
 
   // per-pack global types
@@ -997,6 +1004,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     packVarTypes[p.namespace] = types;
   }
 
+  // re-usable helpers
   const tokensToPref = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
   const withChainTo = (sink: string[]) => (chain: string, cmd: string) => sink.push(tokensToPref(chain)(cmd));
 
@@ -1045,7 +1053,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     ): string[][] {
       const pref = tokensToPref(chain);
       const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
-
       void envTypes;
 
       function leaf(c: CmpCond | RawCond): string[] {
@@ -1105,7 +1112,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           else diagnostics.push({ severity: "Error", message: `Dynamic string assignment not supported`, line: assign.line, col: assign.col });
           return;
         }
-        // number
         const tmpLines: string[] = [];
         const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePref(c)), tmpState, resolveVar);
         outArr.push(...tmpLines);
@@ -1152,17 +1158,17 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           emitMacroCall(line, refs, chain, localScores, envTypes, outArr);
           return;
         }
-        const types: Record<string, VarKind> = { ...envTypes };
-        if (localScores) for (const k of Object.keys(localScores)) types[k] = "number";
+        const typesLocal: Record<string, VarKind> = { ...envTypes };
+        if (localScores) for (const k of Object.keys(localScores)) typesLocal[k] = "number";
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
 
-        const t = inferType(expr, types);
+        const t = inferType(expr, typesLocal);
         if (t === "number" && expr.kind !== "Var" && expr.kind !== "Number") {
-          const tmp = compileNumericExpr(expr, (c) => outArr.push(tokensToPref(chain)(c)), tmpState, resolveVar);
+          const tmp = compileNumericExpr(expr, (c) => outArr.push(tokensToPref(chain)(c)), { n: tmpState.n++ }, resolveVar);
           withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
           return;
         }
-        const { comps, ok } = exprToTellrawComponents(expr, p.namespace, types, resolveVar);
+        const { comps, ok } = exprToTellrawComponents(expr, p.namespace, typesLocal, resolveVar);
         if (ok && comps.length === 1 && "text" in comps[0]) withChain(chain, `say ${JSON.stringify(comps[0].text)}`);
         else if (ok) withChain(chain, `tellraw @a ${JSON.stringify(comps)}`);
         else diagnostics.push({ severity: "Error", message: `Say(...) supports literals, +, and simple vars.`, line: expr.line, col: expr.col });
@@ -1193,9 +1199,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         envTypes: Record<string, VarKind>,
         outArr: string[]
       ) {
-
         void outArr;
-
         if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, outArr); return; }
         for (const v of stmt.variants) {
           const parts: string[] = [];
@@ -1217,8 +1221,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         outArr: string[]
       ) {
         const withChain = withChainTo(outArr);
-
-        // Flatten branches
         const branches: Array<{ negated: boolean; cond: Condition | null | undefined; body: Stmt[] }> = [];
         let cur: IfBlock | ElseBlock | null | undefined = first;
         while (cur) {
@@ -1236,8 +1238,10 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         const flag = `__ifdone_${fn.name}_${ifCounter++}`;
         withChain(chain, `scoreboard players set ${flag} vars 0`);
 
+        const tmpStateLocal = { n: 0 };
+
         for (const b of branches) {
-          const variants = condToVariants(b.cond ?? null, chain, localScores, envTypes, outArr, tmpState, b.negated);
+          const variants = condToVariants(b.cond ?? null, chain, localScores, envTypes, outArr, tmpStateLocal, b.negated);
           for (const parts of variants) {
             const guard = [ `if score ${flag} vars matches 0`, ...parts ].join(" ");
             const next = [chain, guard].filter(Boolean).join(" ");
@@ -1247,7 +1251,6 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         }
       }
 
-      
       function emitFor(
         stmt: ForStmt,
         chain: string,
@@ -1259,26 +1262,26 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         const entryName = `__for_${fn.name}_${loopId}`;
         const stepName  = `__for_${fn.name}_${loopId}__step`;
 
-        void outArr;
         const localScores: Record<string, string> = {};
         const localTypes: Record<string, VarKind> = { ...envTypes };
 
-        // init (goes into parent function sink)
+        // init (parent sink)
         if (stmt.init && "kind" in stmt.init) {
           if ((stmt.init as any).kind === "VarDecl" && !(stmt.init as VarDeclStmt).isGlobal) {
             const d = stmt.init as VarDeclStmt;
             localScores[d.name] = localScoreName(p.namespace, fn.name, loopId, d.name);
             localTypes[d.name] = "number";
-            const tmp = compileNumericExpr(d.init, (c) => fnOut.push(tokensToPref(chain)(c)), tmpState, (n) => localScores[n] ?? scoreName(p.namespace, n));
+            const tmp = compileNumericExpr(d.init, (c) => fnOut.push(tokensToPref(chain)(c)), { n: 0 }, (n) => localScores[n] ?? scoreName(p.namespace, n));
             withChainParent(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
           } else if ((stmt.init as any).kind === "Assign") {
             emitAssign(stmt.init as AssignStmt, chain, null, envTypes, fnOut);
           }
         }
 
-        // entry file: check condition then call step
+        // entry file
         const entryLines: string[] = [];
-        const variants = condToVariants(stmt.cond ?? null, chain, localScores, localTypes, entryLines, tmpState, false);
+        const tmpStateEntry = { n: 0 };
+        const variants = condToVariants(stmt.cond ?? null, chain, localScores, localTypes, entryLines, tmpStateEntry, false);
         if (variants.length === 0) variants.push([]);
         for (const parts of variants) {
           const guard = parts.length ? `execute ${parts.join(" ")} run function ${p.namespace}:${stepName}` : `function ${p.namespace}:${stepName}`;
@@ -1291,11 +1294,9 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         if (stmt.incr) emitAssign(stmt.incr, chain, localScores, localTypes, stepLines);
         stepLines.push(tokensToPref(chain)(`function ${p.namespace}:${entryName}`));
 
-        // write aux files
         files.push({ path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" });
         files.push({ path: `data/${p.namespace}/function/${stepName}.mcfunction`, contents: stepLines.join("\n") + "\n" });
 
-        // kick the loop (parent sink)
         withChainParent(chain, `function ${p.namespace}:${entryName}`);
       }
 
@@ -1348,7 +1349,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         }
       }
 
-      // emit function body to its sink
+      // body -> file
       for (const st of fn.body) emitStmt(st, "", null, packVarTypes[p.namespace], fnOut);
       files.push({ path: `data/${p.namespace}/function/${fn.name}.mcfunction`, contents: fnOut.join("\n") + (fnOut.length ? "\n" : "") });
     }
@@ -1368,73 +1369,68 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       files.push({ path: `data/${p.namespace}/advancements/${n}.json`, contents: JSON.stringify(advJson, null, 2) + "\n" });
     }
 
-    // --- Recipes (shapeless + shaped, with custom-item result) ---
-for (const p of ast.packs) {
-  // Prepare a lookup of custom items by "<ns>.<name>"
-  const itemLookup: Record<string, { baseId: string; comps?: Record<string, any> }> = {};
-  for (const it of p.items) {
-    itemLookup[`${p.namespace}.${it.name}`] = {
-      baseId: it.baseId,
-      comps: componentTokensToMap(it.componentTokens)
-    };
-  }
+    // Recipes (shaped + shapeless) under data/<ns>/recipe/
+    // Build item lookup for custom-item result resolution
+    const itemLookup: Record<string, { baseId: string; comps?: Record<string, any> }> = {};
+    for (const it of p.items) {
+      itemLookup[`${p.namespace}.${it.name}`] = {
+        baseId: it.baseId,
+        comps: componentTokensToMap(it.componentTokens)
+      };
+    }
 
-  for (const r of p.recipes) {
-    const n = r.name.toLowerCase();
+    for (const r of p.recipes) {
+      const n = r.name.toLowerCase();
 
-    // Resolve result
-    let resId = (r.result?.id ?? "minecraft:stone");
-    let resCount = r.result?.count ?? 1;
-    let resComponents: Record<string, any> | undefined;
+      let resId = (r.result?.id ?? "minecraft:stone");
+      let resCount = r.result?.count ?? 1;
+      let resComponents: Record<string, any> | undefined;
 
-    // If "ns.itemName", pull from itemLookup
-    if (!resId.includes(":") && resId.includes(".")) {
-      const hit = itemLookup[resId];
-      if (hit) {
-        resComponents = hit.comps;
-        resId = hit.baseId;
+      if (!resId.includes(":") && resId.includes(".")) {
+        const hit = itemLookup[resId];
+        if (hit) {
+          resComponents = hit.comps;
+          resId = hit.baseId;
+        } else {
+          diagnostics.push({
+            severity: "Warning",
+            message: `Result '${resId}' not found as custom Item in namespace '${p.namespace}'. Using literal id.`,
+            line: 1, col: 1
+          });
+        }
+      }
+
+      if ((r.type ?? "shapeless") === "shaped") {
+        const type = "minecraft:crafting_shaped";
+        const pattern = r.pattern && r.pattern.length ? r.pattern : ["###"];
+        const key: Record<string, any> = {};
+        for (const [ch, id] of Object.entries(r.keys ?? {})) key[ch] = { item: id };
+        const result: any = { id: resId, count: resCount };
+        if (resComponents && Object.keys(resComponents).length) result.components = resComponents;
+        const json = { type, pattern, key, result };
+        files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
       } else {
-        diagnostics.push({
-          severity: "Warning",
-          message: `Result '${resId}' not found as custom Item in namespace '${p.namespace}'. Falling back to literal.`,
-          line: 1, col: 1
-        });
+        const type = "minecraft:crafting_shapeless";
+        const ingredients = (r.ingredients ?? []).map(id => ({ item: id }));
+        const result: any = { id: resId, count: resCount };
+        if (resComponents && Object.keys(resComponents).length) result.components = resComponents;
+        const json = { type, ingredients, result };
+        files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
       }
     }
-
-    if ((r.type ?? "shapeless") === "shaped") {
-      const type = "minecraft:crafting_shaped";
-      const pattern = r.pattern && r.pattern.length ? r.pattern : ["###"];
-      const key: Record<string, any> = {};
-      for (const [ch, id] of Object.entries(r.keys ?? {})) {
-        key[ch] = { item: id };
-      }
-      const result: any = { id: resId, count: resCount };
-      if (resComponents && Object.keys(resComponents).length) {
-        result.components = resComponents;
-      }
-      const json = { type, pattern, key, result };
-      files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
-    } else {
-      // shapeless (existing behavior)
-      const type = "minecraft:crafting_shapeless";
-      const ingredients = (r.ingredients ?? []).map(id => ({ item: id }));
-      const result: any = { id: resId, count: resCount };
-      if (resComponents && Object.keys(resComponents).length) {
-        result.components = resComponents;
-      }
-      const json = { type, ingredients, result };
-      files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
-    }
-  }
-}
-
 
     // Items -> give functions
     for (const it of p.items) {
       const comps = it.componentTokens ? tokensToText(it.componentTokens) : "";
       const giveLine = comps ? `give @s ${it.baseId}[${comps}] 1` : `give @s ${it.baseId} 1`;
       files.push({ path: `data/${p.namespace}/function/give/${it.name}.mcfunction`, contents: giveLine + "\n" });
+    }
+
+    // Tags
+    for (const td of p.tags) {
+      const tagPath = `data/${p.namespace}/tags/${td.category}/${td.name.toLowerCase()}.json`;
+      const tagJson = { replace: td.replace, values: td.values };
+      files.push({ path: tagPath, contents: JSON.stringify(tagJson, null, 2) + "\n" });
     }
   }
 
@@ -1475,7 +1471,7 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
       monaco.languages.setMonarchTokensProvider(id, {
         tokenizer: {
           root: [
-            [/pack|namespace|func|global|var|let|Say|say|Execute|execute|if|unless|else|Run|run|for|adv|recipe|criterion|title|description|desc|icon|parent|type|ingredient|result|Item|base_id|components/, "keyword"],
+            [/pack|namespace|func|global|var|let|Say|say|Execute|execute|if|unless|else|Run|run|for|adv|recipe|criterion|title|description|desc|icon|parent|type|ingredient|result|pattern|key|Item|base_id|components|BlockTag|ItemTag|replace|values/, "keyword"],
             [/\"[^\"]*\"/, "string"],
             [/\d+/, "number"],
             [/[a-zA-Z_@~^\[\]:.][a-zA-Z0-9_@~^\[\]:.]*/, "identifier"],
@@ -1487,11 +1483,12 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
     }
 
     const disp = monaco.languages.registerCompletionItemProvider(id, {
-      triggerCharacters: [".", " ", "\"", "(", ")", "+", "-", "*", "/", "%", "|", "=", "[", "]", ":", ","],
+      triggerCharacters: [".", " ", "\"", "(", ")", "+", "-", "*", "/", "%", "|", "=", "[", "]", ":", ",",
+                          "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"],
       provideCompletionItems: (model: any, position: any) => {
         const suggestions: any[] = [];
 
-        const kw = ["pack", "namespace", "func", "global", "var", "let", "Say", "Execute", "if", "unless", "else", "Run", "for", "adv", "recipe", "Item"];
+        const kw = ["pack", "namespace", "func", "global", "var", "let", "Say", "Execute", "if", "unless", "else", "Run", "for", "adv", "recipe", "Item", "BlockTag", "ItemTag", "pattern", "key"];
         for (const k of kw) suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Keyword, insertText: k });
 
         const textBefore = model.getValueInRange({ startLineNumber: Math.max(1, position.lineNumber - 20), startColumn: 1, endLineNumber: position.lineNumber, endColumn: position.column });
@@ -1504,9 +1501,7 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
             "minecraft:damage=",
             "minecraft:unbreakable=",
           ];
-          for (const k of compKeys) {
-            suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Property, insertText: k });
-          }
+          for (const k of compKeys) suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Property, insertText: k });
         }
 
         suggestions.push({
@@ -1536,17 +1531,68 @@ function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
           insertText: `Execute(as @s, at @s){\n  if("entity @s"){\n    Say("Hi")\n  }\n}\n`,
           detail: "Execute with condition"
         });
+        suggestions.push({
+          label: "BlockTag",
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText:
+`BlockTag \${1:Solid}{
+  replace = \${2:true}
+  values:[
+    "minecraft:stone",
+    "minecraft:air"
+  ];
+}`,
+          detail: "data/<ns>/tags/blocks/<name>.json"
+        });
+        suggestions.push({
+          label: "ItemTag",
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText:
+`ItemTag \${1:Treasure}{
+  replace = \${2:false}
+  values:[
+    "minecraft:stick",
+    "minecraft:string"
+  ];
+}`,
+          detail: "data/<ns>/tags/items/<name>.json"
+        });
+        suggestions.push({
+          label: "Shaped recipe",
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText:
+`recipe \${1:emerald_sword}{
+  type shaped;
+  pattern [
+    " A ",
+    " A ",
+    " B ",
+  ];
+  key A = minecraft:emerald;
+  key B = minecraft:stick;
+  result \${2:zombiespawn.emerald_sword} 1;
+}`,
+          detail: "crafting_shaped with custom-item result"
+        });
 
         // packs & symbols
         const packIds = Object.keys(symbols.packs);
         for (const p of packIds) suggestions.push({ label: p, kind: monaco.languages.CompletionItemKind.Module, insertText: p });
 
+        // context after a dot: pack.func() OR give.<item>()
         const lineText = model.getLineContent(position.lineNumber).slice(0, position.column - 1);
         const lastDot = lineText.lastIndexOf(".");
         if (lastDot >= 0) {
           const before = lineText.slice(0, lastDot);
           const packId = (before.split(/[^A-Za-z0-9_.]/).pop() || "").trim();
-          if (packId === "give") suggestions.push({ label: "<item>()", kind: monaco.languages.CompletionItemKind.Function, insertText: "<item>()", detail: "give.<item>()" });
+          if (packId === "give") {
+            // offer item names from all packs in this file (or narrow to current pack only if desired)
+            for (const [pid, s] of Object.entries(symbols.packs)) {
+              for (const it of Array.from(s.items)) {
+                suggestions.push({ label: it, kind: monaco.languages.CompletionItemKind.Function, insertText: `${it}()`, detail: `give ${pid}:${it}` });
+              }
+            }
+          }
           const pack = symbols.packs[packId];
           if (pack) {
             for (const fn of Array.from(pack.funcs)) {
@@ -1588,7 +1634,7 @@ pack "Fizz Buzz" namespace FizzBuzz{
   func Tick(){}
 
   func FizzBuzz(){
-    for (var i = 1 | i < 61 | i++){
+    for (var i = 1 | i < 31 | i++){
       if(i % 3 == 0 && i % 5 == 0){
         Say("FizzBuzz")
       }else if(i % 3 == 0){
@@ -1602,6 +1648,43 @@ pack "Fizz Buzz" namespace FizzBuzz{
   }
 }
 
+pack "Items + Recipes + Tags" namespace zombieSpawn{
+
+  Item emerald_sword{
+    base_id = "minecraft:wooden_sword";
+    components: [
+      minecraft:item_model="zombiespawn:emerald_sword",
+      minecraft:item_name="Emerald Sword"
+    ];
+  }
+
+  recipe emerald_sword{
+    type shaped;
+    pattern [
+      " A ",
+      " A ",
+      " B ",
+    ];
+    key A = minecraft:emerald;
+    key B = minecraft:stick;
+    // Use custom item as result -> pulls base_id + components
+    result zombiespawn.emerald_sword 1;
+  }
+
+  BlockTag Solid{
+    replace = true;
+    values:[
+      "minecraft:stone",
+      "minecraft:air"
+    ];
+  }
+
+  func Load(){
+    give.emerald_sword()
+  }
+
+  func Tick(){}
+}
 `;
 
 function FileList({ files, onSelect, selected }: { files: GeneratedFile[]; selected?: string; onSelect: (p: string) => void }) {
@@ -1622,14 +1705,20 @@ function FileList({ files, onSelect, selected }: { files: GeneratedFile[]; selec
 }
 
 function DiagnosticsPanel({ diags }: { diags: Diagnostic[] }) {
-  if (!diags.length) return <div className="text-sm text-emerald-400">No diagnostics. ✓</div>;
+  if (!diags.length) return (
+    <div className="text-sm text-emerald-400 flex items-center gap-2">
+      <span>✓</span> No diagnostics.
+    </div>
+  );
   return (
     <div className="space-y-2">
       {diags.map((d, i) => (
         <div key={i} className={`rounded-xl p-3 border ${d.severity === "Error" ? "border-red-500/40 bg-red-500/10" : "border-amber-500/40 bg-amber-500/10"} text-neutral-200`}>
-          <div className="text-xs opacity-70">{d.severity}</div>
-          <div className="text-sm font-medium">{d.message}</div>
-          <div className="text-xs opacity-70">Line {d.line}, Col {d.col}</div>
+          <div className="flex items-center justify-between">
+            <div className="text-xs uppercase tracking-wide opacity-70">{d.severity}</div>
+            <div className="text-xs opacity-70">Line {d.line}, Col {d.col}</div>
+          </div>
+          <div className="text-sm font-medium mt-1">{d.message}</div>
         </div>
       ))}
     </div>
@@ -1660,7 +1749,8 @@ export default function WebDatapackCompiler() {
     const res = compile(debouncedSource);
     setCompiled(res);
     if (res.files.length && !selectedPath) setSelectedPath(res.files[0].path);
-  }, [debouncedSource]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSource]);
 
   async function downloadZip() {
     if (!compiled.files.length) return;
@@ -1683,7 +1773,7 @@ export default function WebDatapackCompiler() {
             <div className="h-9 w-9 rounded-md bg-indigo-500 text-white grid place-items-center font-bold">DP</div>
             <div>
               <h1 className="text-xl font-semibold tracking-tight">Datapack Web Compiler</h1>
-              <p className="text-xs text-neutral-400">Globals • Execute • for-loops • If/Else • &&/|| • Adv/Recipes • Items • IntelliSense • Zip export</p>
+              <p className="text-xs text-neutral-400">Globals • Execute • for/if • &&/|| • Items • Tags • Adv/Recipes • IntelliSense • Zip export</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -1737,7 +1827,7 @@ export default function WebDatapackCompiler() {
               <p><b>Items:</b> <code>Item emerald_sword {'{'} base_id = "minecraft:wooden_sword"; components: [ minecraft:item_model="zombieSpawn:emerald_sword" ]; {'}'}</code> → <code>function &lt;ns&gt;:give/emerald_sword</code> or <code>give.emerald_sword()</code></p>
               <p><b>Macros:</b> <code>Say($&quot;Hello {'{'}i{'}'}&quot;)</code>, <code>Run($&quot;summon ~{'{'}x{'}'} ~ ~{'{'}z{'}'}&quot;)</code> — executed with <code>with storage &lt;ns&gt;:variables</code>.</p>
               <p><b>for:</b> <code>for (var i = 0 | i &lt; 10 | i++)</code> or <code>for (num | num &lt; 10 | num++)</code></p>
-              <p><b>if-chain:</b> <code>if(a && b) {} else if(c || d) {} else {}</code></p>
+              <p><b>Tags:</b> <code>BlockTag Solid {'{'} replace = true; values:[ "minecraft:stone" ]; {'}'}</code> → <code>data/&lt;ns&gt;/tags/blocks/solid.json</code></p>
             </div>
           </div>
         </div>
