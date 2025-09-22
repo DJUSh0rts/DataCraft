@@ -662,6 +662,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 const PACK_FORMAT = 48;
 type VarKind = "string" | "number";
 
+
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
 function localScoreName(ns: string, fn: string, idx: number, name: string) { return `__${fn}_for${idx}_${name}`; }
 function tmpScoreName(idx: number) { return `__tmp${idx}`; }
@@ -762,6 +763,8 @@ function exprToTellrawComponents(
 ): { comps: any[], ok: boolean } {
   const parts: any[] = [];
   let ok = true;
+
+  void ns;
 
   function pushExpr(e: Expr) {
     switch (e.kind) {
@@ -892,6 +895,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     ): string[][] {
       const pref = tokensToPref(chain);
       const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
+
+      void envTypes;
 
       function leaf(c: CmpCond | RawCond): string[] {
         if ((c as RawCond).kind === "Raw") {
@@ -1038,6 +1043,9 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         envTypes: Record<string, VarKind>,
         outArr: string[]
       ) {
+
+        void outArr;
+        
         if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, outArr); return; }
         for (const v of stmt.variants) {
           const parts: string[] = [];
@@ -1089,6 +1097,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         }
       }
 
+      
       function emitFor(
         stmt: ForStmt,
         chain: string,
