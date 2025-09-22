@@ -1,0 +1,18 @@
+/* Make the app visible without Tailwind */
+html, body, #root { height: 100%; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #0a0a0a; color: #e5e7eb; font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; }
+a { color: #93c5fd; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+button { background:#111827; color:#e5e7eb; border:1px solid #374151; padding:.45rem .8rem; border-radius:6px; cursor:pointer; }
+button:hover { background:#1f2937; }
+input { background:#0b0f19; color:#e5e7eb; border:1px solid #374151; padding:.5rem .7rem; border-radius:6px; }
+.border { border:1px solid #1f2937; }
+.rounded-md { border-radius: 6px; }
+.rounded-xl { border-radius: 12px; }
+.bg-neutral-900 { background:#111827; }
+.bg-neutral-950 { background:#0a0a0a; }
+.text-neutral-200 { color:#e5e7eb; }
+.text-neutral-300 { color:#d1d5db; }
+.text-neutral-400 { color:#9ca3af; }
+.text-emerald-400 { color:#34d399; }
