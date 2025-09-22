@@ -644,49 +644,85 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     return vals;
   }
 
-  function parseTag(kindLow: string): TagDecl {
-    const nameTok = expect("Identifier");
-    const name = nameTok.value!;
-    expect("LBrace");
+  function parseTag(): TagDecl {
+  // Accept "BlockTag", "ItemTag", etc.; derive the tag folder from it.
+  const kw = expect("Identifier"); // e.g. BlockTag / ItemTag
+  const kwVal = (kw.value || "");
+  if (!/tag$/i.test(kwVal)) {
+    throw { message: `Expected <Something>Tag (e.g. BlockTag, ItemTag)`, line: kw.line, col: kw.col };
+  }
+  const tagType = kwVal.slice(0, -3).toLowerCase(); // "block", "item", ...
 
-    let replace = false;
-    let values: string[] = [];
+  const nameTok = expect("Identifier");
+  const name = nameTok.value!;
 
-    while (peek().type !== "RBrace" && peek().type !== "EOF") {
-      const t = expect("Identifier");
-      const key = (t.value ?? "").toLowerCase();
+  // Optional () like other decls (ignored)
+  if (match("LParen")) expect("RParen");
 
-      if (key === "replace") {
-        if (peek().type === "Equals" || peek().type === "Colon") pos++;
-        const b = expect("Identifier");
-        const bl = (b.value ?? "").toLowerCase();
-        if (bl !== "true" && bl !== "false") {
-          throw { message: `replace must be true or false`, line: b.line, col: b.col };
-        }
-        replace = (bl === "true");
-        match("Semicolon");
-        continue;
-      }
+  expect("LBrace");
 
-      if (key === "values") {
-        if (peek().type === "Colon") pos++;
-        values = parseStringOrIdentArrayInBrackets();
-        match("Semicolon");
-        continue;
-      }
+  let replace = false;
+  let values: string[] = [];
 
-      diags.push({ severity: "Warning", message: `Unknown Tag property '${t.value}'`, line: t.line, col: t.col });
-      while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+  while (peek().type !== "RBrace" && peek().type !== "EOF") {
+    const t = expect("Identifier");
+    const rawKey = t.value || "";
+    // normalize keys: handle "values:", "values : ", "values:["
+    const key = rawKey.toLowerCase().replace(/[:\[]+$/, "");
+
+    // replace = true/false;
+    if (key === "replace") {
+      if (peek().type === "Equals" || peek().type === "Colon") pos++; // allow "=" or ":"
+      const vTok = expect("Identifier", "true/false");
+      replace = (vTok.value || "").toLowerCase() === "true";
       match("Semicolon");
+      continue;
     }
 
-    expect("RBrace");
+    // values: [ "minecraft:stone", "minecraft:air" ];
+    if (key === "values") {
+      if (peek().type === "Colon") pos++; // optional ":"
 
-    const category: TagCategory =
-      kindLow === "blocktag" ? "blocks" : "items";
+      // If "[" was glued to the identifier (e.g., "values:["), don't expect another LBracket.
+      const hadBracketInKey = /[:\[]$/.test(rawKey);
+      if (!hadBracketInKey) expect("LBracket");
 
-    return { kind: "Tag", category, name, replace, values, line: nameTok.line, col: nameTok.col };
+      const arr: string[] = [];
+      while (peek().type !== "RBracket" && peek().type !== "EOF") {
+        const s = expect("String", "tag value string");
+        arr.push(s.value || "");
+        match("Comma"); // optional comma
+      }
+      expect("RBracket");
+      match("Semicolon"); // optional trailing semicolon after the array
+      values = arr;
+      continue;
+    }
+
+    // Unknown property: warn and skip to next ';' or '}'.
+    diags.push({
+      severity: "Warning",
+      message: `Unknown Tag property '${rawKey}'`,
+      line: t.line,
+      col: t.col,
+    });
+    while (peek().type !== "Semicolon" && peek().type !== "RBrace" && peek().type !== "EOF") pos++;
+    match("Semicolon");
   }
+
+  expect("RBrace");
+
+  return {
+    kind: "Tag",
+    tagType,           // "block", "item", ...
+    name,              // tag file name
+    replace,           // boolean
+    values,            // array of string IDs
+    line: kw.line,
+    col: kw.col,
+  };
+}
+
 
   function parseAssignOrCallOrSayRun(): Stmt | null {
     const t = expect("Identifier"); const low = (t.value ?? "").toLowerCase();
