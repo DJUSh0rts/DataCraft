@@ -1260,11 +1260,10 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       }
 
       function emitFor(
-        stmt: ForStmt,
-        chain: string,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) {
+  stmt: ForStmt,
+  chain: string,
+  envTypes: Record<string, VarKind>
+) {
         const withChainParent = withChainTo(fnOut);
         const loopId = forCounter++;
         const entryName = `__for_${fn.name}_${loopId}`;
@@ -1352,8 +1351,9 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
             return;
 
           case "For":
-            emitFor(st, chain, envTypes, outArr);
-            return;
+  emitFor(st, chain, envTypes);
+  return;
+
         }
       }
 
