@@ -24,3 +24,15 @@ self.MonacoEnvironment = {
     }
   }
 };
+
+
+// src/monaco-setup.ts
+import loader from "@monaco-editor/loader";
+
+// lock to a specific monaco version for stability
+loader.config({
+  paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.44.0/min/vs" },
+});
+
+// (Optional) you can hook when monaco is ready
+// loader.init().then((monaco) => { /* e.g., extra languages config */ });

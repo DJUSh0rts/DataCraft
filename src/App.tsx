@@ -1,18 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./monaco-setup";
-import JSZip from "jszip";
-import Editor, { OnMount, useMonaco } from "@monaco-editor/react";
+import Editor, { useMonaco } from "@monaco-editor/react";
+import type { OnMount } from "@monaco-editor/react";
 import "./basic-dark.css";
 
 /**
- * Datapack Web Compiler
- * - for-loops, if/else-if/else, && / ||
- * - Execute blocks, Say/Run (with macro strings $"...")
- * - Globals (strings -> storage <ns>:variables, numbers -> scoreboard "vars")
- * - Items + give alias: give.<item>()
- * - Advancements & Recipes (shaped + shapeless) with custom-item result resolution
- * - Tags: BlockTag, ItemTag (replace, values:[...])
- * - VS Code-ish dark UI + IntelliSense + Monaco markers + File tree + Zip export
+ * Datapack Web Compiler (Typed)
+ * - Types: string | int | float | double | bool | Ent (+ arrays of each)
+ * - Commands: Say($"..."), Run($"..."), Execute{...}, for/if/else, &&, ||
+ * - Globals stored in storage <ns>:variables; int/bool mirrored to scoreboard "vars"
+ * - Math: Min/Max/Pow/Root/PI (int math), Random.value(min,max) -> /random value <min>..<max>
+ * - Ent: Ent.Get("<selector args>") stores literal selector "@e[limit=1,<args>]"
+ * - Items, Advancements, Recipes, Tags
+ * - Monaco syntax + IntelliSense + Problems panel + File tree + Preview
  */
 
 // ---------- Types ----------
@@ -36,7 +36,10 @@ type StringExpr = { kind: "String"; value: string; line: number; col: number };
 type NumberExpr = { kind: "Number"; value: number; line: number; col: number };
 type VarExpr   = { kind: "Var"; name: string; line: number; col: number };
 type BinaryExpr= { kind: "Binary"; op: "+" | "-" | "*" | "/" | "%"; left: Expr; right: Expr; line: number; col: number };
-type Expr = StringExpr | NumberExpr | VarExpr | BinaryExpr;
+type CallExpr  = { kind: "CallExpr"; target?: string; name: string; args: Expr[]; line: number; col: number };
+type MemberExpr= { kind: "Member"; object: Expr; name: string; line: number; col: number };
+type ArrayExpr = { kind: "Array"; items: Expr[]; line: number; col: number };
+type Expr = StringExpr | NumberExpr | VarExpr | BinaryExpr | CallExpr | MemberExpr | ArrayExpr;
 
 // Conditions
 type CmpOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
@@ -52,10 +55,15 @@ type ExecMod =
   | { kind: "positioned"; x: string; y: string; z: string };
 type ExecVariant = { mods: ExecMod[] };
 
+// Type system
+type TypeName =
+  | "string" | "int" | "float" | "double" | "bool" | "Ent"
+  | "string[]" | "int[]" | "float[]" | "double[]" | "bool[]" | "Ent[]";
+
 // Statements
 type SayStmt = { kind: "Say"; expr: Expr };
 type RunStmt = { kind: "Run"; expr: Expr };
-type VarDeclStmt = { kind: "VarDecl"; isGlobal: boolean; name: string; init: Expr; line: number; col: number };
+type VarDeclStmt = { kind: "VarDecl"; isGlobal: boolean; varType: TypeName; name: string; init: Expr; line: number; col: number };
 type AssignStmt = { kind: "Assign"; name: string; op: "=" | "+=" | "-=" | "*=" | "/=" | "%="; expr: Expr; line: number; col: number };
 type CallStmt = { kind: "Call"; targetPack?: string; func: string; line: number; col: number };
 type ElseBlock = { kind: "Else"; body: Stmt[]; line: number; col: number };
@@ -89,12 +97,9 @@ type RecipeDecl = {
   kind: "Recipe";
   name: string;
   type?: "shapeless" | "shaped";
-  // shapeless:
   ingredients: string[];
-  // shaped:
-  pattern?: string[];            // [" A ", " B ", " C "]
-  keys?: Record<string, string>; // { A: "minecraft:stick" }
-  // result: vanilla id or custom item alias ns.name
+  pattern?: string[];
+  keys?: Record<string, string>;
   result?: { id: string; count?: number };
 };
 
@@ -161,10 +166,14 @@ function lex(input: string): Token[] {
       continue;
     }
 
-    // numbers (int)
+    // numbers (int or float)
     if (/[0-9]/.test(ch) || (ch === "-" && /[0-9]/.test(peek(1) ?? ""))) {
       let j = i + 1;
-      while (j < input.length && /[0-9]/.test(input[j])) j++;
+      let sawDot = false;
+      while (j < input.length && (/[0-9]/.test(input[j]) || (!sawDot && input[j] === "."))) {
+        if (input[j] === ".") sawDot = true;
+        j++;
+      }
       push({ type: "Number", value: String(Number(input.slice(i, j))), line, col });
       col += (j - i); i = j; continue;
     }
@@ -256,14 +265,87 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     throw { message: `Expected ${what ?? tt} but found ${t.value ?? t.type}`, line: t.line, col: t.col };
   };
 
+  function parseTypeName(): TypeName {
+    const t = expect("Identifier", "type name");
+    const baseLower = (t.value || "").toLowerCase();
+    let array = false;
+    if (peek().type === "LBracket" && tokens[pos + 1]?.type === "RBracket") { pos += 2; array = true; }
+    const canonicalBase = baseLower === "ent" ? "Ent" : baseLower;
+    const valid = ["string","int","float","double","bool","Ent"];
+    if (!valid.includes(canonicalBase)) throw { message: `Unknown type '${t.value}'`, line: t.line, col: t.col };
+    return (canonicalBase + (array ? "[]":"")) as TypeName;
+  }
+
+  function parseArgList(): Expr[] {
+    const args: Expr[] = [];
+    expect("LParen");
+    if (peek().type !== "RParen") {
+      args.push(parseExpr());
+      while (match("Comma")) args.push(parseExpr());
+    }
+    expect("RParen");
+    return args;
+  }
+
+  function parseArrayLiteral(L: number, C: number): Expr {
+    const items: Expr[] = [];
+    while (peek().type !== "RBracket" && peek().type !== "EOF") {
+      items.push(parseExpr());
+      match("Comma");
+    }
+    expect("RBracket");
+    return { kind: "Array", items, line: L, col: C };
+  }
+
   function parsePrimary(): Expr {
     const t = peek();
     if (t.type === "String") { pos++; return { kind: "String", value: t.value!, line: t.line, col: t.col }; }
     if (t.type === "Number") { pos++; return { kind: "Number", value: Number(t.value!), line: t.line, col: t.col }; }
-    if (t.type === "Identifier") { pos++; return { kind: "Var", name: t.value!, line: t.line, col: t.col }; }
+    if (t.type === "LBracket") {
+      const L = t.line, C = t.col; pos++;
+      return parseArrayLiteral(L, C);
+    }
+    if (t.type === "Identifier") {
+      const idTok = t; pos++;
+      // Dotted call like Math.Min(...)
+      if (peek().type === "Dot") {
+        pos++;
+        const nameTok = expect("Identifier", "function");
+        const name = nameTok.value!;
+        if (peek().type === "LParen") {
+          const args = parseArgList();
+          return parsePostfix({ kind: "CallExpr", target: idTok.value, name, args, line: idTok.line, col: idTok.col });
+        } else {
+          return parsePostfix({ kind: "Member", object: { kind: "Var", name: idTok.value!, line: idTok.line, col: idTok.col }, name: nameTok.value!, line: nameTok.line, col: nameTok.col });
+        }
+      }
+      // Simple call Foo(...)
+      if (peek().type === "LParen") {
+        const args = parseArgList();
+        return parsePostfix({ kind: "CallExpr", name: idTok.value!, args, line: idTok.line, col: idTok.col });
+      }
+      // Plain var
+      return parsePostfix({ kind: "Var", name: idTok.value!, line: idTok.line, col: idTok.col });
+    }
     if (t.type === "LParen") { pos++; const e = parseExpr(); expect("RParen", "')'"); return e; }
     throw { message: `Unexpected token in expression: ${t.value ?? t.type}`, line: t.line, col: t.col };
   }
+
+  function parsePostfix(base: Expr): Expr {
+    while (peek().type === "Dot") {
+      pos++;
+      const nameTok = expect("Identifier", "member");
+      const name = nameTok.value!;
+      if (peek().type === "LParen") {
+        const args = parseArgList();
+        base = { kind: "CallExpr", target: undefined, name, args: [base, ...args], line: nameTok.line, col: nameTok.col };
+      } else {
+        base = { kind: "Member", object: base, name, line: nameTok.line, col: nameTok.col };
+      }
+    }
+    return base;
+  }
+
   function parseUnary(): Expr {
     if (match("Minus")) {
       const e = parseUnary();
@@ -327,15 +409,47 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     return left;
   }
 
+  function defaultInitFor(varType: TypeName): Expr {
+    const base = (varType.endsWith("[]") ? varType.slice(0, -2) : varType) as Exclude<TypeName, `${string}[]`>;
+    if (varType.endsWith("[]")) return { kind: "Array", items: [], line: 0, col: 0 };
+    switch (base) {
+      case "string": return { kind: "String", value: "", line: 0, col: 0 };
+      case "Ent":    return { kind: "String", value: "", line: 0, col: 0 };
+      case "bool":   return { kind: "Number", value: 0, line: 0, col: 0 };
+      case "int":    return { kind: "Number", value: 0, line: 0, col: 0 };
+      case "float":  return { kind: "Number", value: 0, line: 0, col: 0 };
+      case "double": return { kind: "Number", value: 0, line: 0, col: 0 };
+      default:       return { kind: "Number", value: 0, line: 0, col: 0 };
+    }
+  }
+
   function parseVarDecl(isGlobalForced = false): VarDeclStmt {
-    const first = expect("Identifier");
-    const low = (first.value ?? "").toLowerCase();
-    if (low !== "var" && low !== "let") throw { message: `Expected 'var' or 'let'`, line: first.line, col: first.col };
-    const name = expect("Identifier").value!;
-    expect("Equals");
-    const init = parseExpr();
+    // forms:
+    //   global <type> name [= expr] ;
+    //   <type> name [= expr] ;
+    let isGlobal = isGlobalForced;
+    let first = expect("Identifier");
+    let low = (first.value ?? "").toLowerCase();
+
+    let varType: TypeName;
+    if (low === "global") {
+      isGlobal = true;
+      varType = parseTypeName();
+    } else if (low === "var" || low === "let") {
+      diags.push({ severity: "Error", message: `Use typed declarations: global <type> name = ... or <type> name = ...`, line: first.line, col: first.col });
+      varType = "int";
+    } else {
+      pos--;
+      varType = parseTypeName();
+    }
+
+    const name = expect("Identifier", "variable name").value!;
+    let init: Expr | null = null;
+    if (match("Equals")) {
+      init = parseExpr();
+    }
     match("Semicolon");
-    return { kind: "VarDecl", isGlobal: isGlobalForced, name, init, line: first.line, col: first.col };
+    return { kind: "VarDecl", isGlobal, varType, name, init: init ?? defaultInitFor(varType), line: first.line, col: first.col };
   }
 
   function parseAssignAfterName(nameTok: Token): AssignStmt {
@@ -431,14 +545,24 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
     let init: VarDeclStmt | AssignStmt | { kind: "Noop" } | null = null;
     if (peek().type !== "Pipe") {
       const t = peek();
-      if (t.type === "Identifier" && ((t.value ?? "").toLowerCase() === "var" || (t.value ?? "").toLowerCase() === "let")) {
-        const d = parseVarDecl(false); init = d;
+      if (t.type === "Identifier" && ((t.value ?? "").toLowerCase() === "global")) {
+        diags.push({ severity: "Error", message: `Use local typed declaration without 'global' inside for-init`, line: t.line, col: t.col });
+        pos++;
+        const d = parseVarDecl(false);
+        init = d;
       } else if (t.type === "Identifier") {
-        const nameTok = expect("Identifier");
-        if (peek().type === "PlusPlus" || peek().type === "MinusMinus" || peek().type === "Equals" || peek().type === "PlusEquals" || peek().type === "MinusEquals" || peek().type === "StarEquals" || peek().type === "SlashEquals" || peek().type === "PercentEquals") {
-          init = parseAssignAfterName(nameTok);
-        } else {
-          init = { kind: "Noop" };
+        const save = pos;
+        try {
+          const decl = parseVarDecl(false);
+          init = decl;
+        } catch {
+          pos = save;
+          const nameTok = expect("Identifier");
+          if (peek().type === "PlusPlus" || peek().type === "MinusMinus" || peek().type === "Equals" || peek().type === "PlusEquals" || peek().type === "MinusEquals" || peek().type === "StarEquals" || peek().type === "SlashEquals" || peek().type === "PercentEquals") {
+            init = parseAssignAfterName(nameTok);
+          } else {
+            init = { kind: "Noop" };
+          }
         }
       } else {
         init = { kind: "Noop" };
@@ -602,7 +726,7 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
       if (key === "base_id") {
         if (peek().type === "Equals" || peek().type === "Colon") pos++;
         const v = peek();
-        if (v.type === "String" || v.type === "Identifier") {
+        if (v.type === "String" || v.type === "Identifier" || v.type === "Number") {
           pos++;
           baseId = String(v.value ?? "");
         } else {
@@ -628,7 +752,6 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
   }
 
   function parseTag(): TagDecl {
-    // Accept "BlockTag", "ItemTag"
     const kw = expect("Identifier");
     const kwVal = (kw.value || "");
     if (!/tag$/i.test(kwVal)) {
@@ -706,26 +829,24 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 
     if (low === "global") {
       const nxt = peek();
-      if (nxt.type === "Identifier" && ((nxt.value ?? "").toLowerCase() === "var" || (nxt.value ?? "").toLowerCase() === "let")) {
-        pos++; const d = parseVarDecl(true); return d;
+      if (nxt.type === "Identifier") {
+        const d = parseVarDecl(true); return d;
       }
-      diags.push({ severity: "Error", message: `Expected 'var' after 'global'`, line: t.line, col: t.col });
+      diags.push({ severity: "Error", message: `Expected type after 'global'`, line: t.line, col: t.col });
       return null;
     }
 
     if (low === "var" || low === "let") {
       const d = parseVarDecl(false);
-      diags.push({ severity: "Warning", message: `Local 'var' ignored outside for-loops. Use global var at pack scope.`, line: t.line, col: t.col });
+      diags.push({ severity: "Error", message: `Use typed declarations instead of 'var/let'`, line: t.line, col: t.col });
       return d;
     }
 
-    // not allowed in function scope; recover
     if (low === "adv") { diags.push({ severity: "Error", message: `adv not allowed inside functions`, line: t.line, col: t.col }); parseAdv(); return null; }
     if (low === "recipe") { diags.push({ severity: "Error", message: `recipe not allowed inside functions`, line: t.line, col: t.col }); parseRecipe(); return null; }
     if (low === "item") { diags.push({ severity: "Error", message: `Item not allowed inside functions`, line: t.line, col: t.col }); parseItem(); return null; }
     if (low === "blocktag" || low === "itemtag") {
       diags.push({ severity: "Error", message: `Tag declarations are not allowed inside functions`, line: t.line, col: t.col });
-      // try to skip {...}
       if (peek().type !== "LBrace") { while (peek().type !== "LBrace" && peek().type !== "EOF") pos++; }
       if (peek().type === "LBrace") {
         let depth = 0;
@@ -795,7 +916,9 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
       if (t.type === "Identifier") {
         const low = (t.value ?? "").toLowerCase();
         if (low === "global") { pos++; const decl = parseVarDecl(true); globals.push(decl); continue; }
-        if (low === "var" || low === "let") { const decl = parseVarDecl(true); globals.push(decl); continue; }
+        if (["string","int","float","double","bool","ent"].includes(low) || (low === "string[]" || low === "int[]" || low === "float[]" || low === "double[]" || low === "bool[]" || low === "ent[]")) {
+          const decl = parseVarDecl(true); globals.push(decl); continue;
+        }
         if (low === "func") { funcs.push(parseFunc()); continue; }
         if (low === "adv") { advs.push(parseAdv()); continue; }
         if (low === "recipe") { recipes.push(parseRecipe()); continue; }
@@ -821,13 +944,36 @@ function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[] } {
 }
 
 // ---------- Validation & Helpers ----------
-const PACK_FORMAT = 48;
+const PACK_FORMAT_CONST = 48;
 
-type VarKind = "string" | "number";
+type VarKind = TypeName;
 
 function scoreName(ns: string, varName: string) { return `_${ns}.${varName}`; }
 function localScoreName(_ns: string, fn: string, idx: number, name: string) { return `__${fn}_for${idx}_${name}`; }
 function tmpScoreName(idx: number) { return `__tmp${idx}`; }
+
+function isArrayKind(k: VarKind) { return /\[\]$/.test(k); }
+function baseOf(k: VarKind): Exclude<VarKind, `${string}[]`> {
+  return (isArrayKind(k) ? (k.replace(/\[\]$/, "") as any) : (k as any)) as any;
+}
+function isNumericKind(k: VarKind) {
+  const b = baseOf(k) as any;
+  return b === "int" || b === "bool";
+}
+function isStoredNumericKind(k: VarKind) {
+  const b = baseOf(k) as any;
+  return b === "int" || b === "bool" || b === "float" || b === "double";
+}
+
+function storageTypeFor(k: VarKind): "int" | "float" | "double" | "byte" | "string" | "raw" {
+  const b = baseOf(k);
+  if (b === "int") return "int";
+  if (b === "float") return "float";
+  if (b === "double") return "double";
+  if (b === "bool") return "byte";
+  if (b === "string" || b === "Ent") return "string";
+  return "raw";
+}
 
 function componentTokensToMap(ts?: Token[]): Record<string, any> | undefined {
   if (!ts || !ts.length) return undefined;
@@ -864,85 +1010,10 @@ function tokensToText(ts: Token[]): string {
       case "RBrace": out += "}"; break;
       case "LBracket": out += "["; break;
       case "RBracket": out += "]"; break;
-      default: out += "";
+      default: out += t.value ?? ""; break;
     }
   }
   return out;
-}
-
-function inferType(expr: Expr, envTypes: Record<string, VarKind | undefined>): VarKind | undefined {
-  switch (expr.kind) {
-    case "String": return "string";
-    case "Number": return "number";
-    case "Var": return envTypes[expr.name];
-    case "Binary": {
-      const l = inferType(expr.left, envTypes), r = inferType(expr.right, envTypes);
-      if (expr.op === "+") {
-        if (l === "string" || r === "string") return "string";
-        if (l === "number" && r === "number") return "number";
-      } else if (l === "number" && r === "number") return "number";
-      return undefined;
-    }
-  }
-}
-
-function isStaticString(_expr: Expr, envTypes: Record<string, VarKind | undefined>): boolean {
-  const expr = _expr as Expr;
-  switch (expr.kind) {
-    case "String": return true;
-    case "Number": return true;
-    case "Var": return false;
-    case "Binary": return expr.op === "+" && isStaticString(expr.left, envTypes) && isStaticString(expr.right, envTypes);
-  }
-}
-function evalStaticString(expr: Expr): string | undefined {
-  switch (expr.kind) {
-    case "String": return expr.value.startsWith("$") ? expr.value.slice(1) : expr.value;
-    case "Number": return String(expr.value);
-    case "Binary": {
-      if (expr.op !== "+") return undefined;
-      const l = evalStaticString(expr.left), r = evalStaticString(expr.right);
-      if (l === undefined || r === undefined) return undefined;
-      return l + r;
-    }
-    default: return undefined;
-  }
-}
-
-// compile numeric expressions into scoreboard temps (returns a temp holder name)
-function compileNumericExpr(
-  expr: Expr,
-  emit: (cmd: string) => void,
-  tmpCounter: { n: number },
-  resolveVarScore: (name: string) => string
-): string {
-  const res = tmpScoreName(tmpCounter.n++);
-
-  function emitTo(target: string, e: Expr): void {
-    switch (e.kind) {
-      case "Number":
-        emit(`scoreboard players set ${target} vars ${Math.trunc(e.value)}`);
-        return;
-      case "Var": {
-        emit(`scoreboard players operation ${target} vars = ${resolveVarScore(e.name)} vars`);
-        return;
-      }
-      case "Binary": {
-        const L = tmpScoreName(tmpCounter.n++), R = tmpScoreName(tmpCounter.n++);
-        emitTo(L, e.left); emitTo(R, e.right);
-        const map: Record<string, string> = { "+": "+=", "-": "-=", "*": "*=", "/": "/=", "%": "%=" };
-        emit(`scoreboard players operation ${L} vars ${map[e.op]} ${R} vars`);
-        emit(`scoreboard players operation ${target} vars = ${L} vars`);
-        return;
-      }
-      case "String":
-        emit(`scoreboard players set ${target} vars 0`);
-        return;
-    }
-  }
-
-  emitTo(res, expr);
-  return res;
 }
 
 function renderMacroTemplate(src: string): { line: string; refs: string[] } {
@@ -956,55 +1027,221 @@ function renderMacroTemplate(src: string): { line: string; refs: string[] } {
 function exprIsMacroString(e: Expr): e is StringExpr {
   return e.kind === "String" && e.value.startsWith("$");
 }
+function isStaticString(e: Expr): boolean {
+  switch (e.kind) {
+    case "String": return !e.value.startsWith("$");
+    case "Number": return true;
+    case "Binary": return e.op === "+" && isStaticString(e.left) && isStaticString(e.right);
+    default: return false;
+  }
+}
+function evalStaticString(e: Expr): string | undefined {
+  switch (e.kind) {
+    case "String": return e.value.startsWith("$") ? e.value.slice(1) : e.value;
+    case "Number": return String(e.value);
+    case "Binary":
+      if (e.op !== "+") return undefined;
+      const L = evalStaticString(e.left), R = evalStaticString(e.right);
+      if (L === undefined || R === undefined) return undefined;
+      return L + R;
+    default:
+      return undefined;
+  }
+}
 
-function exprToTellrawComponents(
+function snbtFromLiteral(kind: VarKind, num: number | boolean | string): string {
+  const b = baseOf(kind);
+  if (b === "string" || b === "Ent") return JSON.stringify(String(num));
+  if (b === "bool") return (num ? "1b" : "0b");
+  if (b === "int") return `${Math.trunc(Number(num))}`;
+  if (b === "float") {
+    const n = Number(num);
+    const s = Number.isInteger(n) ? `${n.toFixed(1)}f` : `${n}f`;
+    return s;
+  }
+  if (b === "double") {
+    const n = Number(num);
+    const s = Number.isInteger(n) ? `${n.toFixed(1)}d` : `${n}d`;
+    return s;
+  }
+  return JSON.stringify(num);
+}
+
+function arrayInitCommands(ns: string, name: string, kind: VarKind, items: Expr[], pushDiag: (d: Diagnostic)=>void): string[] {
+  const b = baseOf(kind);
+  const cmds: string[] = [];
+  cmds.push(`data remove storage ${ns}:variables ${name}`);
+  cmds.push(`data modify storage ${ns}:variables ${name} set value []`);
+  const toLit = (e: Expr): string | undefined => {
+    if (b === "string" || b === "Ent") {
+      if (e.kind === "String" && !e.value.startsWith("$")) return JSON.stringify(e.value);
+      if (e.kind === "Number") return JSON.stringify(String(e.value));
+      return undefined;
+    }
+    if (b === "bool") {
+      if (e.kind === "Number") return e.value ? "1b" : "0b";
+      if (e.kind === "String") return (e.value.toLowerCase() === "true" ? "1b" : "0b");
+      return undefined;
+    }
+    if (b === "int") {
+      if (e.kind === "Number") return `${Math.trunc(e.value)}`;
+      return undefined;
+    }
+    if (b === "float" || b === "double") {
+      if (e.kind === "Number") return snbtFromLiteral(kind, e.value);
+      return undefined;
+    }
+    return undefined;
+  };
+  items.forEach((it, idx) => {
+    const lit = toLit(it);
+    if (lit === undefined) { pushDiag({ severity: "Error", message: `Array element ${idx} for ${name} must be literal of type ${b}`, line: it.line ?? 0, col: it.col ?? 0 }); return; }
+    cmds.push(`data modify storage ${ns}:variables ${name}[${idx}] set value ${lit}`);
+  });
+  return cmds;
+}
+
+// ---------- Numeric expression compiler ----------
+function compileNumericExpr(
   expr: Expr,
   ns: string,
-  types: Record<string, VarKind>,
-  resolveVarScore: (name: string) => string
-): { comps: any[], ok: boolean } {
-  const parts: any[] = [];
-  let ok = true;
-
-  function pushExpr(e: Expr) {
+  emit: (cmd: string) => void,
+  tmpCounter: { n: number },
+  resolveScoreForVar: (name: string) => string,
+  resolveKindForVar: (name: string) => VarKind | undefined,
+  diagnostics: Diagnostic[]
+): string {
+  const res = tmpScoreName(tmpCounter.n++);
+  const to = (target: string, e: Expr): void => {
     switch (e.kind) {
-      case "String": parts.push({ text: e.value }); return;
-      case "Number": parts.push({ text: String(e.value) }); return;
+      case "Number":
+        emit(`scoreboard players set ${target} vars ${Math.trunc(e.value)}`);
+        return;
       case "Var": {
-        const t = types[e.name];
-        if (!t) { parts.push({ text: `<${e.name}>` }); ok = false; return; }
-        if (t === "string") parts.push({ nbt: e.name, storage: `${ns}:variables` });
-        else parts.push({ score: { name: resolveVarScore(e.name), objective: "vars" } });
+        const vk = resolveKindForVar(e.name);
+        if (!vk || !isStoredNumericKind(vk)) {
+          diagnostics.push({ severity: "Error", message: `Variable '${e.name}' is not numeric`, line: e.line, col: e.col });
+          emit(`scoreboard players set ${target} vars 0`);
+          return;
+        }
+        if (isNumericKind(vk)) {
+          emit(`scoreboard players operation ${target} vars = ${resolveScoreForVar(e.name)} vars`);
+        } else {
+          emit(`execute store result score ${target} vars run data get storage ${ns}:variables ${e.name} 1`);
+        }
         return;
       }
       case "Binary": {
-        if (e.op !== "+") { ok = false; return; }
-        pushExpr(e.left); pushExpr(e.right); return;
+        const L = tmpScoreName(tmpCounter.n++), R = tmpScoreName(tmpCounter.n++);
+        to(L, e.left); to(R, e.right);
+        const map: Record<BinaryExpr["op"], string> = { "+": "+=", "-": "-=", "*": "*=", "/": "/=", "%": "%=" };
+        emit(`scoreboard players operation ${L} vars ${map[e.op]} ${R} vars`);
+        emit(`scoreboard players operation ${target} vars = ${L} vars`);
+        return;
       }
-    }
-  }
+      case "CallExpr": {
+        const tgt = (e.target || "").toLowerCase();
+        const name = e.name.toLowerCase();
 
-  pushExpr(expr);
-  return { comps: parts, ok };
-}
+        // Random.value(min, max)
+        if (tgt === "random" && name === "value") {
+          let minLit: number | undefined = undefined, maxLit: number | undefined = undefined;
+          if (e.args[0]?.kind === "Number") minLit = Math.trunc(e.args[0].value);
+          if (e.args[1]?.kind === "Number") maxLit = Math.trunc(e.args[1].value);
+          if (minLit === undefined || maxLit === undefined) {
+            diagnostics.push({ severity: "Warning", message: `Random.value(...) expects literal numeric bounds. Using 0..100 as fallback.`, line: e.line, col: e.col });
+            minLit = 0; maxLit = 100;
+          }
+          emit(`execute store result score ${target} vars run random value ${minLit}..${maxLit}`);
+          return;
+        }
 
-function validate(ast: Script): Diagnostic[] {
-  const diags: Diagnostic[] = [];
-  const nsSet = new Set<string>();
-  for (const p of ast.packs) {
-    if (!/^[a-z0-9_.-]+$/.test(p.namespace)) diags.push({ severity: "Error", message: `Namespace '${p.namespace}' must match [a-z0-9_.-]`, line: 1, col: 1 });
-    if (nsSet.has(p.namespace)) diags.push({ severity: "Error", message: `Duplicate namespace '${p.namespace}' across packs`, line: 1, col: 1 });
-    nsSet.add(p.namespace);
-    for (const f of p.functions) {
-      if (!/^[a-z0-9_/.+-]+$/.test(f.name)) diags.push({ severity: "Error", message: `Function '${f.name}' has invalid characters`, line: 1, col: 1 });
+        // Math.PI()
+        if (tgt === "math" && name === "pi") {
+          emit(`scoreboard players set ${target} vars 3`);
+          diagnostics.push({ severity: "Info", message: `Math.PI approximated as 3 (int math)`, line: e.line, col: e.col });
+          return;
+        }
+
+        if (tgt === "math" && (name === "min" || name === "max")) {
+          const A = tmpScoreName(tmpCounter.n++), B = tmpScoreName(tmpCounter.n++);
+          to(A, e.args[0]); to(B, e.args[1]);
+          emit(`scoreboard players operation ${target} vars = ${A} vars`);
+          if (name === "min") emit(`execute if score ${B} vars < ${target} vars run scoreboard players operation ${target} vars = ${B} vars`);
+          else emit(`execute if score ${B} vars > ${target} vars run scoreboard players operation ${target} vars = ${B} vars`);
+          return;
+        }
+
+        // Math.Pow(n, p) small p
+        if (tgt === "math" && name === "pow") {
+          const base = tmpScoreName(tmpCounter.n++); to(base, e.args[0]);
+          const power = (e.args[1]?.kind === "Number" ? Math.trunc(e.args[1].value) : 0);
+          if (power < 0 || power > 10) {
+            diagnostics.push({ severity: "Warning", message: `Math.Pow supports 0..10`, line: e.line, col: e.col });
+          }
+          emit(`scoreboard players set ${target} vars 1`);
+          for (let i = 0; i < Math.max(0, Math.min(10, power)); i++) emit(`scoreboard players operation ${target} vars *= ${base} vars`);
+          return;
+        }
+
+        // Math.Root(n, p) rough
+        if (tgt === "math" && name === "root") {
+          const num = tmpScoreName(tmpCounter.n++); to(num, e.args[0]);
+          const pwr = (e.args[1]?.kind === "Number" ? Math.trunc(e.args[1].value) : 2);
+          emit(`scoreboard players set ${target} vars 0`);
+          for (let c = 0; c <= 100; c++) {
+            const cScore = tmpScoreName(tmpCounter.n++);
+            const prod = tmpScoreName(tmpCounter.n++);
+            emit(`scoreboard players set ${cScore} vars ${c}`);
+            emit(`scoreboard players set ${prod} vars 1`);
+            for (let i = 0; i < Math.max(0, Math.min(10, pwr)); i++) emit(`scoreboard players operation ${prod} vars *= ${cScore} vars`);
+            emit(`execute if score ${prod} vars <= ${num} vars run scoreboard players operation ${target} vars = ${cScore} vars`);
+          }
+          return;
+        }
+
+        // Ent.GetData(ent,"Health") -> numeric
+        if (name === "getdata" && e.args.length >= 2) {
+          const keyExpr = e.args[1];
+          if (keyExpr.kind === "String") {
+            // inline Ent.Get
+            if (e.args[0].kind === "CallExpr" && ((e.args[0].target || "").toLowerCase() === "ent") && e.args[0].name.toLowerCase() === "get" && e.args[0].args[0]?.kind === "String") {
+              const selectorStr = `@e[limit=1,${(e.args[0].args[0] as StringExpr).value}]`;
+              emit(`execute as ${selectorStr} store result score ${target} vars run data get entity @s ${keyExpr.value} 1`);
+              return;
+            }
+            diagnostics.push({ severity: "Warning", message: `GetData works best with inline Ent.Get(...) in this build`, line: e.line, col: e.col });
+          }
+          emit(`scoreboard players set ${target} vars 0`);
+          return;
+        }
+
+        // Ent.Get(...) itself is not numeric
+        if ((e.target || "").toLowerCase() === "ent" && e.name.toLowerCase() === "get") {
+          diagnostics.push({ severity: "Error", message: `Ent.Get(...) is not numeric`, line: e.line, col: e.col });
+          emit(`scoreboard players set ${target} vars 0`);
+          return;
+        }
+
+        diagnostics.push({ severity: "Error", message: `Unsupported call in numeric expression: ${(e.target ? e.target + "." : "") + e.name}`, line: e.line, col: e.col });
+        emit(`scoreboard players set ${target} vars 0`);
+        return;
+      }
+      case "String":
+        emit(`scoreboard players set ${target} vars 0`);
+        return;
+      case "Member":
+      case "Array":
+        diagnostics.push({ severity: "Error", message: `Unsupported expression in numeric context`, line: e.line, col: e.col });
+        emit(`scoreboard players set ${target} vars 0`);
+        return;
     }
-  }
-  return diags;
+  };
+  to(res, expr);
+  return res;
 }
 
 // ---------- Generation ----------
-const PACK_FORMAT_CONST = 48;
-
 function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnostic[]; symbolIndex: SymbolIndex } {
   const diagnostics: Diagnostic[] = [];
   const files: GeneratedFile[] = [];
@@ -1017,55 +1254,86 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     symbolIndex.packs[p.namespace] = { title: p.packTitle, vars: new Set(p.globals.map(g => g.name)), funcs: new Set(p.functions.map(f => f.name)), items: new Set(p.items.map(i => i.name)) };
   }
 
-  // per-pack global types
   const packVarTypes: Record<string, Record<string, VarKind>> = {};
   for (const p of ast.packs) {
     const types: Record<string, VarKind> = {};
-    for (const g of p.globals) {
-      const t = inferType(g.init, types);
-      if (!t) diagnostics.push({ severity: "Error", message: `Cannot infer type of global '${g.name}'`, line: g.line, col: g.col });
-      else types[g.name] = t;
-    }
+    for (const g of p.globals) types[g.name] = g.varType;
     packVarTypes[p.namespace] = types;
   }
 
-  // re-usable helpers
-  const tokensToPref = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
-  const withChainTo = (sink: string[]) => (chain: string, cmd: string) => sink.push(tokensToPref(chain)(cmd));
-
   for (const p of ast.packs) {
-    // bootstrap
+    // bootstrap + setup
     const boot = [`execute unless data storage ${p.namespace}:system bootstrap run function ${p.namespace}:__setup`];
     files.push({ path: `data/${p.namespace}/function/__bootstrap.mcfunction`, contents: boot.join("\n") + "\n" });
     const setup = [`scoreboard objectives add vars dummy`, `data modify storage ${p.namespace}:system bootstrap set value 1b`];
     files.push({ path: `data/${p.namespace}/function/__setup.mcfunction`, contents: setup.join("\n") + "\n" });
 
-    // init globals
-    const types = packVarTypes[p.namespace];
     const init: string[] = [];
+    const tmpState = { n: 0 };
+    const resolveKind = (name: string) => packVarTypes[p.namespace][name];
+    const resolveScore = (name: string) => scoreName(p.namespace, name);
+
+    // --- Global initializers ---
     for (const g of p.globals) {
-      const t = types[g.name];
-      if (!t) continue;
-      if (t === "string") {
-        if (isStaticString(g.init, types)) {
-          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(evalStaticString(g.init)!)}`);
+      const kind = g.varType;
+      const b = baseOf(kind);
+
+      if (isArrayKind(kind)) {
+        if (g.init.kind === "Array") {
+          const cmds = arrayInitCommands(p.namespace, g.name, kind, g.init.items, d => diagnostics.push(d));
+          init.push(...cmds);
         } else {
-          diagnostics.push({ severity: "Warning", message: `String init for '${g.name}' must be a static literal/concat; skipped`, line: g.line, col: g.col });
+          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value []`);
         }
-      } else {
-        const tmpLines: string[] = [];
-        const tmpState = { n: 0 };
-        const tmp = compileNumericExpr(g.init, (c) => tmpLines.push(c), tmpState, (n) => scoreName(p.namespace, n));
-        tmpLines.push(`scoreboard players operation ${scoreName(p.namespace, g.name)} vars = ${tmp} vars`);
-        init.push(...tmpLines);
+        continue;
       }
+
+      if (b === "string") {
+        const lit = isStaticString(g.init) ? evalStaticString(g.init)! : "";
+        init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(lit)}`);
+        continue;
+      }
+
+      if (b === "Ent") {
+        if (g.init.kind === "CallExpr" && (g.init.target || "").toLowerCase() === "ent" && g.init.name.toLowerCase() === "get" && g.init.args[0]?.kind === "String") {
+          const selector = `@e[limit=1,${(g.init.args[0] as StringExpr).value}]`;
+          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(selector)}`);
+        } else if (g.init.kind === "String" && !g.init.value.startsWith("$")) {
+          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(g.init.value)}`);
+        } else {
+          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ""`);
+        }
+        continue;
+      }
+
+      if (isStoredNumericKind(kind)) {
+        if (b === "int" || b === "bool") {
+          const tmp = compileNumericExpr(g.init, p.namespace, c => init.push(c), tmpState, resolveScore, resolveKind, diagnostics);
+          init.push(`scoreboard players operation ${scoreName(p.namespace, g.name)} vars = ${tmp} vars`);
+          const stype = storageTypeFor(kind);
+          init.push(`execute store result storage ${p.namespace}:variables ${g.name} ${stype} 1 run scoreboard players get ${scoreName(p.namespace, g.name)} vars`);
+        } else {
+          if (g.init.kind === "Number") {
+            init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${snbtFromLiteral(kind, g.init.value)}`);
+          } else {
+            init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${snbtFromLiteral(kind, 0)}`);
+          }
+        }
+        continue;
+      }
+
+      diagnostics.push({ severity: "Error", message: `Unsupported global type for '${g.name}'`, line: g.line, col: g.col });
     }
+
     files.push({ path: `data/${p.namespace}/function/__init.mcfunction`, contents: init.join("\n") + (init.length ? "\n" : "") });
 
-    // --- Functions ---
+    // --- Function emit utilities ---
     let forCounter = 0;
     let macroCounter = 0;
     let ifCounter = 0;
+
+    const tokensToPref = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
+    const withChainTo = (sink: string[]) => (chain: string, cmd: string) => sink.push(tokensToPref(chain)(cmd));
 
     function condToVariants(
       cond: Condition | null | undefined,
@@ -1077,8 +1345,7 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       negate = false
     ): string[][] {
       const pref = tokensToPref(chain);
-      const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
-      void envTypes;
+      const resolveVarScore = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
 
       function leaf(c: CmpCond | RawCond): string[] {
         if ((c as RawCond).kind === "Raw") {
@@ -1086,8 +1353,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           return [ `${negate ? "unless" : "if"} ${cr.raw}` ];
         } else {
           const cc = c as CmpCond;
-          const L = compileNumericExpr(cc.left,  (c)=>outArr.push(pref(c)), tmpState, resolveVar);
-          const R = compileNumericExpr(cc.right, (c)=>outArr.push(pref(c)), tmpState, resolveVar);
+          const L = compileNumericExpr(cc.left,  p.namespace, (c)=>outArr.push(pref(c)), tmpState, resolveVarScore, (n)=>envTypes[n], diagnostics);
+          const R = compileNumericExpr(cc.right, p.namespace, (c)=>outArr.push(pref(c)), tmpState, resolveVarScore, (n)=>envTypes[n], diagnostics);
           const map: Record<CmpOp, string> = { "==":"=", "!=":"!=", "<":"<", "<=":"<=", ">":">", ">=":">=" };
           return [ `${negate ? "unless" : "if"} score ${L} vars ${map[cc.op]} ${R} vars` ];
         }
@@ -1115,858 +1382,582 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       return walk(cond);
     }
 
-    for (const fn of p.functions) {
-      const fnOut: string[] = [];
-      const tmpState = { n: 0 };
-
-      const emitAssign = (
-        assign: AssignStmt,
-        chain: string,
-        localScores: Record<string, string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) => {
-        const withChain = withChainTo(outArr);
-        const makePref = tokensToPref(chain);
-        const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
-        const vk = envTypes[assign.name] || (localScores && assign.name in localScores ? "number" : undefined);
-        if (!vk) { diagnostics.push({ severity: "Error", message: `Unknown variable '${assign.name}'`, line: assign.line, col: assign.col }); return; }
-        if (vk === "string") {
-          if (assign.op !== "=") { diagnostics.push({ severity: "Error", message: `Only '=' supported for string variables`, line: assign.line, col: assign.col }); return; }
-          if (isStaticString(assign.expr, envTypes)) withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(evalStaticString(assign.expr)!)}`);
-          else diagnostics.push({ severity: "Error", message: `Dynamic string assignment not supported`, line: assign.line, col: assign.col });
-          return;
+    function emitMacroCall(
+      macroBodyLine: string,
+      refs: string[],
+      chain: string,
+      localScores: Record<string, string> | null,
+      envTypes: Record<string, VarKind>,
+      outArr: string[]
+    ) {
+      const withChain = withChainTo(outArr);
+      for (const r of refs) {
+        const local = localScores && (r in localScores);
+        const k = envTypes[r];
+        if (local) {
+          withChain(chain, `execute store result storage ${p.namespace}:variables ${r} int 1 run scoreboard players get ${localScores![r]} vars`);
+        } else if (k && isStoredNumericKind(k) && (k === "int" || k === "bool")) {
+          withChain(chain, `execute store result storage ${p.namespace}:variables ${r} int 1 run scoreboard players get ${scoreName(p.namespace, r)} vars`);
         }
-        const tmpLines: string[] = [];
-        const tmp = compileNumericExpr(assign.expr, (c) => tmpLines.push(makePref(c)), tmpState, resolveVar);
+      }
+      const macroName = `__macro_${macroCounter++}`;
+      const macroBody = `$${macroBodyLine}\n`;
+      files.push({ path: `data/${p.namespace}/function/${macroName}.mcfunction`, contents: macroBody });
+      withChain(chain, `function ${p.namespace}:${macroName} with storage ${p.namespace}:variables`);
+    }
+
+    function emitSay(
+      expr: Expr,
+      chain: string,
+      localScores: Record<string, string> | null,
+      envTypes: Record<string, VarKind>,
+      outArr: string[]
+    ) {
+      const withChain = withChainTo(outArr);
+      if (exprIsMacroString(expr)) {
+        const raw = expr.value.slice(1);
+        const { line, refs } = renderMacroTemplate(`say ${raw}`);
+        emitMacroCall(line, refs, chain, localScores, envTypes, outArr);
+        return;
+      }
+
+      const tmpLines: string[] = [];
+      const tmpStateLocal = { n: 0 };
+      const resolveScore = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
+      const tmp = compileNumericExpr(expr, p.namespace, c => tmpLines.push(tokensToPref(chain)(c)), tmpStateLocal, resolveScore, (n)=>envTypes[n], diagnostics);
+      if (tmpLines.length) {
         outArr.push(...tmpLines);
-        const target = `${resolveVar(assign.name)} vars`;
-        const opMap: Record<AssignStmt["op"], string> = { "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=" };
-        withChain(chain, `scoreboard players operation ${target} ${opMap[assign.op]} ${tmp} vars`);
-      };
-
-      const emitMacroCall = (
-        cmdLine: string,
-        refs: string[],
-        chain: string,
-        localScores: Record<string, string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) => {
-        const withChain = withChainTo(outArr);
-        for (const r of refs) {
-          const local = localScores && (r in localScores);
-          const globalKind = envTypes[r];
-          if (local) {
-            withChain(chain, `execute store result storage ${p.namespace}:variables ${r} int 1 run scoreboard players get ${localScores![r]} vars`);
-          } else if (globalKind === "number") {
-            withChain(chain, `execute store result storage ${p.namespace}:variables ${r} int 1 run scoreboard players get ${scoreName(p.namespace, r)} vars`);
-          }
-        }
-        const macroName = `__macro_${fn.name}_${macroCounter++}`;
-        const macroBody = `$${cmdLine}\n`;
-        files.push({ path: `data/${p.namespace}/function/${macroName}.mcfunction`, contents: macroBody });
-        withChain(chain, `function ${p.namespace}:${macroName} with storage ${p.namespace}:variables`);
-      };
-
-      const emitSay = (
-        expr: Expr,
-        chain: string,
-        localScores: Record<string, string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) => {
-        const withChain = withChainTo(outArr);
-        if (exprIsMacroString(expr)) {
-          const raw = expr.value.slice(1);
-          const { line, refs } = renderMacroTemplate(`say ${raw}`);
-          emitMacroCall(line, refs, chain, localScores, envTypes, outArr);
-          return;
-        }
-        const typesLocal: Record<string, VarKind> = { ...envTypes };
-        if (localScores) for (const k of Object.keys(localScores)) typesLocal[k] = "number";
-        const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
-
-        const t = inferType(expr, typesLocal);
-        if (t === "number" && expr.kind !== "Var" && expr.kind !== "Number") {
-          const tmp = compileNumericExpr(expr, (c) => outArr.push(tokensToPref(chain)(c)), { n: tmpState.n++ }, resolveVar);
-          withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
-          return;
-        }
-        const { comps, ok } = exprToTellrawComponents(expr, p.namespace, typesLocal, resolveVar);
-        if (ok && comps.length === 1 && "text" in comps[0]) withChain(chain, `say ${JSON.stringify(comps[0].text)}`);
-        else if (ok) withChain(chain, `tellraw @a ${JSON.stringify(comps)}`);
-        else diagnostics.push({ severity: "Error", message: `Say(...) supports literals, +, and simple vars.`, line: expr.line, col: expr.col });
-      };
-
-      const emitRun = (
-        expr: Expr,
-        chain: string,
-        _localScores: Record<string, string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) => {
-        const withChain = withChainTo(outArr);
-        if (exprIsMacroString(expr)) {
-          const raw = expr.value.slice(1);
-          const { line, refs } = renderMacroTemplate(raw);
-          emitMacroCall(line, refs, chain, _localScores, envTypes, outArr);
-          return;
-        }
-        if (!isStaticString(expr, envTypes)) { diagnostics.push({ severity: "Error", message: `Run(...) must be a static string or macro string`, line: expr.line, col: expr.col }); return; }
-        withChain(chain, evalStaticString(expr)!);
-      };
-
-      function emitExecute(
-        stmt: ExecuteStmt,
-        chain: string,
-        localScores: Record<string, string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) {
-        if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, outArr); return; }
-        for (const v of stmt.variants) {
-          const parts: string[] = [];
-          for (const m of v.mods) {
-            if (m.kind === "as") parts.push(`as ${m.arg}`);
-            else if (m.kind === "at") parts.push(`at ${m.arg}`);
-            else if (m.kind === "positioned") parts.push(`positioned ${m.x} ${m.y} ${m.z}`);
-          }
-          const next = [chain, parts.join(" ")].filter(Boolean).join(" ");
-          for (const s of stmt.body) emitStmt(s, next, localScores, envTypes, outArr);
-        }
+        withChain(chain, `tellraw @a {"score":{"name":"${tmp}","objective":"vars"}}`);
+        return;
       }
 
-      function emitIfChain(
-        first: IfBlock,
-        chain: string,
-        localScores: Record<string,string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) {
-        const withChain = withChainTo(outArr);
-        const branches: Array<{ negated: boolean; cond: Condition | null | undefined; body: Stmt[] }> = [];
-        let cur: IfBlock | ElseBlock | null | undefined = first;
-        while (cur) {
-          if ((cur as IfBlock).kind === "If") {
-            const ib = cur as IfBlock;
-            branches.push({ negated: ib.negated, cond: ib.cond, body: ib.body });
-            cur = ib.elseBranch ?? null;
-          } else {
-            const eb = cur as ElseBlock;
-            branches.push({ negated: false, cond: null, body: eb.body });
-            cur = null;
-          }
-        }
-
-        const flag = `__ifdone_${fn.name}_${ifCounter++}`;
-        withChain(chain, `scoreboard players set ${flag} vars 0`);
-
-        const tmpStateLocal = { n: 0 };
-
-        for (const b of branches) {
-          const variants = condToVariants(b.cond ?? null, chain, localScores, envTypes, outArr, tmpStateLocal, b.negated);
-          for (const parts of variants) {
-            const guard = [ `if score ${flag} vars matches 0`, ...parts ].join(" ");
-            const next = [chain, guard].filter(Boolean).join(" ");
-            for (const s of b.body) emitStmt(s, next, localScores, envTypes, outArr);
-            withChain(next, `scoreboard players set ${flag} vars 1`);
-          }
-        }
-      }
-
-      function emitFor(
-        stmt: ForStmt,
-        chain: string,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) {
-        const withChainParent = withChainTo(fnOut);
-        const loopId = forCounter++;
-        const entryName = `__for_${fn.name}_${loopId}`;
-        const stepName  = `__for_${fn.name}_${loopId}__step`;
-
-        const localScores: Record<string, string> = {};
-        const localTypes: Record<string, VarKind> = { ...envTypes };
-
-        // init (parent sink)
-        if (stmt.init && "kind" in stmt.init) {
-          if ((stmt.init as any).kind === "VarDecl" && !(stmt.init as VarDeclStmt).isGlobal) {
-            const d = stmt.init as VarDeclStmt;
-            localScores[d.name] = localScoreName(p.namespace, fn.name, loopId, d.name);
-            localTypes[d.name] = "number";
-            const tmp = compileNumericExpr(d.init, (c) => fnOut.push(tokensToPref(chain)(c)), { n: 0 }, (n) => localScores[n] ?? scoreName(p.namespace, n));
-            withChainParent(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
-          } else if ((stmt.init as any).kind === "Assign") {
-            emitAssign(stmt.init as AssignStmt, chain, null, envTypes, fnOut);
-          }
-        }
-
-        // entry file
-        const entryLines: string[] = [];
-        const tmpStateEntry = { n: 0 };
-        const variants = condToVariants(stmt.cond ?? null, chain, localScores, localTypes, entryLines, tmpStateEntry, false);
-        if (variants.length === 0) variants.push([]);
-        for (const parts of variants) {
-          const guard = parts.length ? `execute ${parts.join(" ")} run function ${p.namespace}:${stepName}` : `function ${p.namespace}:${stepName}`;
-          entryLines.push(tokensToPref(chain)(guard));
-        }
-
-        // step file: body -> incr -> recurse
-        const stepLines: string[] = [];
-        for (const s of stmt.body) emitStmt(s, chain, localScores, localTypes, stepLines);
-        if (stmt.incr) emitAssign(stmt.incr, chain, localScores, localTypes, stepLines);
-        stepLines.push(tokensToPref(chain)(`function ${p.namespace}:${entryName}`));
-
-        files.push({ path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" });
-        files.push({ path: `data/${p.namespace}/function/${stepName}.mcfunction`, contents: stepLines.join("\n") + "\n" });
-
-        withChainParent(chain, `function ${p.namespace}:${entryName}`);
-      }
-
-      function emitStmt(
-        st: Stmt,
-        chain: string,
-        localScores: Record<string, string> | null,
-        envTypes: Record<string, VarKind>,
-        outArr: string[]
-      ) {
-        switch (st.kind) {
-          case "VarDecl":
-            diagnostics.push({ severity: "Warning", message: st.isGlobal ? `global var must be declared at pack scope` : `Local 'var' outside for-init is ignored`, line: st.line, col: st.col });
-            return;
-
-          case "Assign":
-            emitAssign(st, chain, localScores, envTypes, outArr);
-            return;
-
-          case "Run":
-            emitRun(st.expr, chain, localScores, envTypes, outArr);
-            return;
-
-          case "Say":
-            emitSay(st.expr, chain, localScores, envTypes, outArr);
-            return;
-
-          case "Call": {
-            const withChain = withChainTo(outArr);
-            if (st.targetPack && st.targetPack.toLowerCase() === "give") {
-              withChain(chain, `function ${p.namespace}:give/${st.func.toLowerCase()}`);
-              return;
-            }
-            const targetNs = st.targetPack ? st.targetPack.toLowerCase() : p.namespace;
-            withChain(chain, `function ${targetNs}:${st.func.toLowerCase()}`);
-            return;
-          }
-
-          case "If":
-            emitIfChain(st, chain, localScores, envTypes, outArr);
-            return;
-
-          case "Execute":
-            emitExecute(st, chain, localScores, envTypes, outArr);
-            return;
-
-          case "For":
-            emitFor(st, chain, envTypes, outArr);
-            return;
-        }
-      }
-
-      // body -> file
-      for (const st of fn.body) emitStmt(st, "", null, packVarTypes[p.namespace], fnOut);
-      files.push({ path: `data/${p.namespace}/function/${fn.name}.mcfunction`, contents: fnOut.join("\n") + (fnOut.length ? "\n" : "") });
-    }
-
-    // Advancements
-    for (const a of p.advs) {
-      const n = a.name.toLowerCase();
-      const crit = a.props.criteria.length ? a.props.criteria : [{ name: "auto", trigger: "minecraft:impossible" }];
-      const criteria = Object.fromEntries(crit.map(c => [c.name, { trigger: c.trigger }]));
-      const display: any = {};
-      if (a.props.title) display.title = a.props.title;
-      if (a.props.description) display.description = a.props.description;
-      if (a.props.icon) display.icon = { item: a.props.icon };
-      const advJson: any = { criteria };
-      if (a.props.parent) advJson.parent = a.props.parent;
-      if (Object.keys(display).length) advJson.display = display;
-      files.push({ path: `data/${p.namespace}/advancements/${n}.json`, contents: JSON.stringify(advJson, null, 2) + "\n" });
-    }
-
-    // Recipes (shaped + shapeless) under data/<ns>/recipe/
-    // Build item lookup for custom-item result resolution
-    const itemLookup: Record<string, { baseId: string; comps?: Record<string, any> }> = {};
-    for (const it of p.items) {
-      itemLookup[`${p.namespace}.${it.name}`] = {
-        baseId: it.baseId,
-        comps: componentTokensToMap(it.componentTokens)
-      };
-    }
-
-    for (const r of p.recipes) {
-      const n = r.name.toLowerCase();
-
-      let resId = (r.result?.id ?? "minecraft:stone");
-      let resCount = r.result?.count ?? 1;
-      let resComponents: Record<string, any> | undefined;
-
-      if (!resId.includes(":") && resId.includes(".")) {
-        const hit = itemLookup[resId];
-        if (hit) {
-          resComponents = hit.comps;
-          resId = hit.baseId;
-        } else {
-          diagnostics.push({
-            severity: "Warning",
-            message: `Result '${resId}' not found as custom Item in namespace '${p.namespace}'. Using literal id.`,
-            line: 1, col: 1
-          });
-        }
-      }
-
-      if ((r.type ?? "shapeless") === "shaped") {
-        const type = "minecraft:crafting_shaped";
-        const pattern = r.pattern && r.pattern.length ? r.pattern : ["###"];
-        const key: Record<string, any> = {};
-        for (const [ch, id] of Object.entries(r.keys ?? {})) key[ch] = { item: id };
-        const result: any = { id: resId, count: resCount };
-        if (resComponents && Object.keys(resComponents).length) result.components = resComponents;
-        const json = { type, pattern, key, result };
-        files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
+      if (isStaticString(expr)) {
+        withChain(chain, `say ${JSON.stringify(evalStaticString(expr)!)}`);
       } else {
-        const type = "minecraft:crafting_shapeless";
-        const ingredients = (r.ingredients ?? []).map(id => ({ item: id }));
-        const result: any = { id: resId, count: resCount };
-        if (resComponents && Object.keys(resComponents).length) result.components = resComponents;
-        const json = { type, ingredients, result };
-        files.push({ path: `data/${p.namespace}/recipe/${n}.json`, contents: JSON.stringify(json, null, 2) + "\n" });
+        diagnostics.push({ severity: "Error", message: `Say(...) supports numeric expressions and static/macro strings.`, line: (expr as any).line ?? 0, col: (expr as any).col ?? 0 });
       }
     }
 
-    // Items -> give functions
-    for (const it of p.items) {
-      const comps = it.componentTokens ? tokensToText(it.componentTokens) : "";
-      const giveLine = comps ? `give @s ${it.baseId}[${comps}] 1` : `give @s ${it.baseId} 1`;
-      files.push({ path: `data/${p.namespace}/function/give/${it.name}.mcfunction`, contents: giveLine + "\n" });
+    function emitRun(
+      expr: Expr,
+      chain: string,
+      _localScores: Record<string, string> | null,
+      envTypes: Record<string, VarKind>,
+      outArr: string[]
+    ) {
+      const withChain = withChainTo(outArr);
+      if (exprIsMacroString(expr)) {
+        const raw = expr.value.slice(1);
+        const { line, refs } = renderMacroTemplate(raw);
+        emitMacroCall(line, refs, chain, _localScores, envTypes, outArr);
+        return;
+      }
+      if (!isStaticString(expr)) { diagnostics.push({ severity: "Error", message: `Run(...) must be a static string or macro string`, line: (expr as any).line ?? 0, col: (expr as any).col ?? 0 }); return; }
+      withChain(chain, evalStaticString(expr)!);
     }
 
-    // Tags
-    for (const td of p.tags) {
-      const tagPath = `data/${p.namespace}/tags/${td.category}/${td.name.toLowerCase()}.json`;
-      const tagJson = { replace: td.replace, values: td.values };
-      files.push({ path: tagPath, contents: JSON.stringify(tagJson, null, 2) + "\n" });
-    }
-  }
+    function emitAssign(
+      assign: AssignStmt,
+      chain: string,
+      localScores: Record<string, string> | null,
+      envTypes: Record<string, VarKind>,
+      outArr: string[]
+    ) {
+      const withChain = withChainTo(outArr);
+      const kind = envTypes[assign.name];
+      if (!kind) { diagnostics.push({ severity: "Error", message: `Unknown variable '${assign.name}'`, line: assign.line, col: assign.col }); return; }
 
-  // load/tick tags
-  const loadValues: string[] = []; const tickValues: string[] = [];
-  for (const p of ast.packs) {
-    loadValues.push(`${p.namespace}:__bootstrap`, `${p.namespace}:__init`);
-    for (const f of p.functions) {
-      if (f.name.toLowerCase() === "load") loadValues.push(`${p.namespace}:${f.name}`);
-      if (f.name.toLowerCase() === "tick") tickValues.push(`${p.namespace}:${f.name}`);
-    }
-  }
-  if (loadValues.length) files.push({ path: `data/minecraft/tags/function/load.json`, contents: JSON.stringify({ values: loadValues }, null, 2) + "\n" });
-  if (tickValues.length) files.push({ path: `data/minecraft/tags/function/tick.json`, contents: JSON.stringify({ values: tickValues }, null, 2) + "\n" });
+      if (isArrayKind(kind)) {
+        if (assign.op !== "=") { diagnostics.push({ severity: "Error", message: `Only '=' supported for arrays`, line: assign.line, col: assign.col }); return; }
+        if (assign.expr.kind !== "Array") { diagnostics.push({ severity: "Error", message: `Array assignment must use [...] literal`, line: assign.line, col: assign.col }); return; }
+        const cmds = arrayInitCommands(p.namespace, assign.name, kind, assign.expr.items, d => diagnostics.push(d));
+        cmds.forEach(c => withChain(chain, c));
+        return;
+      }
 
-  return { files, diagnostics, symbolIndex };
-}
+      const b = baseOf(kind);
+      if (b === "string") {
+        if (assign.op !== "=") { diagnostics.push({ severity: "Error", message: `Only '=' supported for string`, line: assign.line, col: assign.col }); return; }
+        if (isStaticString(assign.expr)) withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(evalStaticString(assign.expr)!)}`);
+        else diagnostics.push({ severity: "Error", message: `String assignment must be static or macro-driven (use Run/Say macros)`, line: assign.line, col: assign.col });
+        return;
+      }
 
-function compile(source: string): { files: GeneratedFile[]; diagnostics: Diagnostic[]; symbolIndex: SymbolIndex } {
-  let tokens: Token[]; const diagnostics: Diagnostic[] = [];
-  try { tokens = lex(source); } catch (e: any) { diagnostics.push({ severity: "Error", message: e.message || "Lex error", line: e.line ?? 0, col: e.col ?? 0 }); return { files: [], diagnostics, symbolIndex: { packs: {} } }; }
-  const { ast, diagnostics: parseDiags } = parse(tokens); diagnostics.push(...parseDiags); if (!ast) return { files: [], diagnostics, symbolIndex: { packs: {} } };
-  const val = validate(ast); diagnostics.push(...val); if (diagnostics.some(d => d.severity === "Error")) return { files: [], diagnostics, symbolIndex: { packs: {} } };
-  const { files, diagnostics: genDiags, symbolIndex } = generate(ast); diagnostics.push(...genDiags);
-  return { files, diagnostics, symbolIndex };
-}
-
-// ---------- IntelliSense ----------
-function useDslLanguage(monacoRef: any, symbols: SymbolIndex) {
-  useEffect(() => {
-    const monaco = monacoRef;
-    if (!monaco) return;
-
-    const id = "datapackdsl";
-    if (!(monaco as any)._dpdslRegistered) {
-      monaco.languages.register({ id });
-      (monaco as any)._dpdslRegistered = true;
-
-      monaco.languages.setMonarchTokensProvider(id, {
-        tokenizer: {
-          root: [
-            [/pack|namespace|func|global|var|let|Say|say|Execute|execute|if|unless|else|Run|run|for|adv|recipe|criterion|title|description|desc|icon|parent|type|ingredient|result|pattern|key|Item|base_id|components|BlockTag|ItemTag|replace|values/, "keyword"],
-            [/\"[^\"]*\"/, "string"],
-            [/\d+/, "number"],
-            [/[a-zA-Z_@~^\[\]:.][a-zA-Z0-9_@~^\[\]:.]*/, "identifier"],
-            [/[{()\[\]}.;,|:]/, "delimiter"],
-            [/(\&\&)|(\|\|)|==|!=|<=|>=|[+\-*/%]=|[+\-*/%]|[<>]|(\+\+|--)/, "operator"],
-          ],
-        },
-      });
-
-      monaco.languages.registerDocumentFormattingEditProvider(id, {
-        provideDocumentFormattingEdits: (model) => {
-          const text = model.getValue();
-          // tiny pretty: trim trailing spaces and ensure newline at EOF
-          const pretty = text.replace(/[ \t]+$/gm, "") + (text.endsWith("\n") ? "" : "\n");
-          return [{ range: model.getFullModelRange(), text: pretty }];
+      if (b === "Ent") {
+        if (assign.op !== "=") { diagnostics.push({ severity: "Error", message: `Only '=' supported for Ent`, line: assign.line, col: assign.col }); return; }
+        if (assign.expr.kind === "CallExpr" && (assign.expr.target || "").toLowerCase() === "ent" && assign.expr.name.toLowerCase() === "get" && assign.expr.args[0]?.kind === "String") {
+          const selector = `@e[limit=1,${(assign.expr.args[0] as StringExpr).value}]`;
+          withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(selector)}`);
+        } else if (assign.expr.kind === "String") {
+          withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(assign.expr.value)}`);
+        } else {
+          diagnostics.push({ severity: "Error", message: `Ent assignment must be Ent.Get("...") or a selector string`, line: assign.line, col: assign.col });
         }
-      });
+        return;
+      }
+
+      if (isStoredNumericKind(kind)) {
+        const resolveScore = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
+        const tmp = compileNumericExpr(assign.expr, p.namespace, c => outArr.push(tokensToPref(chain)(c)), { n: 0 }, resolveScore, (n)=>envTypes[n], diagnostics);
+        const target = localScores && (assign.name in localScores) ? localScores[assign.name] : scoreName(p.namespace, assign.name);
+        const opMap: Record<AssignStmt["op"], string> = { "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=" };
+        withChain(chain, `scoreboard players operation ${target} vars ${opMap[assign.op]} ${tmp} vars`);
+        if (b === "int" || b === "bool") {
+          const st = storageTypeFor(kind);
+          withChain(chain, `execute store result storage ${p.namespace}:variables ${assign.name} ${st} 1 run scoreboard players get ${target} vars`);
+        }
+        return;
+      }
+
+      diagnostics.push({ severity: "Error", message: `Unsupported assignment to ${b}`, line: assign.line, col: assign.col });
     }
 
-    const disp = monaco.languages.registerCompletionItemProvider(id, {
-      triggerCharacters: [".", " ", "\"", "(", ")", "+", "-", "*", "/", "%", "|", "=", "[", "]", ":", ",",
-                          "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"],
-      provideCompletionItems: (model: any, position: any) => {
-        const suggestions: any[] = [];
+    function emitExecute(stmt: ExecuteStmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, outArr: string[]) {
+      if (!stmt.variants.length) { for (const s of stmt.body) emitStmt(s, chain, localScores, envTypes, outArr); return; }
+      for (const v of stmt.variants) {
+        const parts: string[] = [];
+        for (const m of v.mods) {
+          if (m.kind === "as") parts.push(`as ${m.arg}`);
+          else if (m.kind === "at") parts.push(`at ${m.arg}`);
+          else if (m.kind === "positioned") parts.push(`positioned ${m.x} ${m.y} ${m.z}`);
+        }
+        const next = [chain, parts.join(" ")].filter(Boolean).join(" ");
+        for (const s of stmt.body) emitStmt(s, next, localScores, envTypes, outArr);
+      }
+    }
 
-        const kw = ["pack", "namespace", "func", "global", "var", "let", "Say", "Execute", "if", "unless", "else", "Run", "for", "adv", "recipe", "Item", "BlockTag", "ItemTag", "pattern", "key"];
-        for (const k of kw) suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Keyword, insertText: k });
+    function emitIfChain(first: IfBlock, chain: string, localScores: Record<string,string> | null, envTypes: Record<string, VarKind>, outArr: string[]) {
+      const withChain = withChainTo(outArr);
+      const branches: Array<{ negated: boolean; cond: Condition | null | undefined; body: Stmt[] }> = [];
+      let cur: IfBlock | ElseBlock | null | undefined = first;
+      while (cur) {
+        if ((cur as IfBlock).kind === "If") {
+          const ib = cur as IfBlock;
+          branches.push({ negated: ib.negated, cond: ib.cond, body: ib.body });
+          cur = ib.elseBranch ?? null;
+        } else {
+          const eb = cur as ElseBlock;
+          branches.push({ negated: false, cond: null, body: eb.body });
+          cur = null;
+        }
+      }
 
-        const textBefore = model.getValueInRange({ startLineNumber: Math.max(1, position.lineNumber - 20), startColumn: 1, endLineNumber: position.lineNumber, endColumn: position.column });
-        const inComponents = /components\s*:\s*\[[\s\S]*$/m.test(textBefore) && !/\]/.test(textBefore.split(/components\s*:/).pop() || "");
-        if (inComponents) {
-          const compKeys = [
-            "minecraft:item_name=",
-            "minecraft:item_model=",
-            "minecraft:custom_name=",
-            "minecraft:damage=",
-            "minecraft:unbreakable=",
-          ];
-          for (const k of compKeys) {
-            suggestions.push({ label: k, kind: monaco.languages.CompletionItemKind.Property, insertText: k });
+      const flag = `__ifdone_${p.namespace}_${ifCounter++}`;
+      withChain(chain, `scoreboard players set ${flag} vars 0`);
+
+      const tmpStateLocal = { n: 0 };
+
+      for (const b of branches) {
+        const variants = condToVariants(b.cond ?? null, chain, localScores, envTypes, outArr, tmpStateLocal, b.negated);
+        for (const parts of variants) {
+          const guard = [ `if score ${flag} vars matches 0`, ...parts ].join(" ");
+          const next = [chain, guard].filter(Boolean).join(" ");
+          for (const s of b.body) emitStmt(s, next, localScores, envTypes, outArr);
+          withChain(next, `scoreboard players set ${flag} vars 1`);
+        }
+      }
+    }
+
+    function emitFor(stmt: ForStmt, chain: string, envTypes: Record<string, VarKind>, outArr: string[]) {
+      const withChainParent = withChainTo(outArr);
+      const loopId = forCounter++;
+      const entryName = `__for_${loopId}`;
+      const stepName  = `__for_${loopId}__step`;
+
+      const localScores: Record<string, string> = {};
+      const localTypes: Record<string, VarKind> = { ...envTypes };
+
+      if (stmt.init && "kind" in stmt.init) {
+        if ((stmt.init as any).kind === "VarDecl" && !(stmt.init as VarDeclStmt).isGlobal) {
+          const d = stmt.init as VarDeclStmt;
+          if (baseOf(d.varType) !== "int") {
+            diagnostics.push({ severity: "Error", message: `for-init local must be int`, line: d.line, col: d.col });
+          } else {
+            localScores[d.name] = localScoreName(p.namespace, "fn", loopId, d.name);
+            localTypes[d.name] = "int";
+            const tmp = compileNumericExpr(d.init, p.namespace, (c) => outArr.push(tokensToPref(chain)(c)), { n: 0 }, (n)=>localScores[n] ?? scoreName(p.namespace, n), (n)=>localTypes[n], diagnostics);
+            withChainParent(chain, `scoreboard players operation ${localScores[d.name]} vars = ${tmp} vars`);
           }
+        } else if ((stmt.init as any).kind === "Assign") {
+          emitAssign(stmt.init as AssignStmt, chain, null, envTypes, outArr);
         }
+      }
 
-        suggestions.push({
-          label: "if / else if / else",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText:
-`if(i % 3 == 0 && i % 5 == 0){
-  Say("FizzBuzz")
-}else if(i % 3 == 0){
-  Say("Fizz")
-}else if(i % 5 == 0){
-  Say("Buzz")
-}else{
-  Say(i)
-}`,
-          detail: "If-chain"
-        });
-        suggestions.push({
-          label: "for loop (local)",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `for (var i = 0 | i < 10 | i++){\n    Say("i=" + i)\n}\n`,
-          detail: "Local numeric loop"
-        });
-        suggestions.push({
-          label: "Execute block",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText: `Execute(as @s, at @s){\n  if("entity @s"){\n    Say("Hi")\n  }\n}\n`,
-          detail: "Execute with condition"
-        });
-        suggestions.push({
-          label: "BlockTag",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText:
-`BlockTag \${1:Solid}{
-  replace = \${2:true}
-  values:[
-    "minecraft:stone",
-    "minecraft:air"
-  ];
-}`,
-          detail: "data/<ns>/tags/blocks/<name>.json"
-        });
-        suggestions.push({
-          label: "ItemTag",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText:
-`ItemTag \${1:Treasure}{
-  replace = \${2:false}
-  values:[
-    "minecraft:stick",
-    "minecraft:string"
-  ];
-}`,
-          detail: "data/<ns>/tags/items/<name>.json"
-        });
-        suggestions.push({
-          label: "Shaped recipe",
-          kind: monaco.languages.CompletionItemKind.Snippet,
-          insertText:
-`recipe \${1:emerald_sword}{
-  type shaped;
-  pattern [
-    " A ",
-    " A ",
-    " B ",
-  ];
-  key A = minecraft:emerald;
-  key B = minecraft:stick;
-  result \${2:zombiespawn.emerald_sword} 1;
-}`,
-          detail: "crafting_shaped with custom-item result"
-        });
+      const entryLines: string[] = [];
+      const tmpStateEntry = { n: 0 };
+      const variants = condToVariants(stmt.cond ?? null, chain, localScores, localTypes, entryLines, tmpStateEntry, false);
+      if (variants.length === 0) variants.push([]);
+      for (const parts of variants) {
+        const guard = parts.length ? `execute ${parts.join(" ")} run function ${p.namespace}:${stepName}` : `function ${p.namespace}:${stepName}`;
+        entryLines.push(tokensToPref(chain)(guard));
+      }
 
-        // packs & symbols
-        const packIds = Object.keys(symbols.packs);
-        for (const p of packIds) suggestions.push({ label: p, kind: monaco.languages.CompletionItemKind.Module, insertText: p });
+      const stepLines: string[] = [];
+      for (const s of stmt.body) emitStmt(s, chain, localScores, localTypes, stepLines);
+      if (stmt.incr) emitAssign(stmt.incr, chain, localScores, localTypes, stepLines);
+      stepLines.push(tokensToPref(chain)(`function ${p.namespace}:${entryName}`));
 
-        // context after a dot: pack.func() OR give.<item>()
-        const lineText = model.getLineContent(position.lineNumber).slice(0, position.column - 1);
-        const lastDot = lineText.lastIndexOf(".");
-        if (lastDot >= 0) {
-          const before = lineText.slice(0, lastDot);
-          const packId = (before.split(/[^A-Za-z0-9_.]/).pop() || "").trim();
-          if (packId === "give") {
-            for (const [pid, s] of Object.entries(symbols.packs)) {
-              for (const it of Array.from(s.items)) {
-                suggestions.push({ label: it, kind: monaco.languages.CompletionItemKind.Function, insertText: `${it}()`, detail: `give ${pid}:${it}` });
+      files.push({ path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" });
+      files.push({ path: `data/${p.namespace}/function/${stepName}.mcfunction`, contents: stepLines.join("\n") + "\n" });
+
+      withChainParent(chain, `function ${p.namespace}:${entryName}`);
+    }
+
+    // local counter for unnamed scoreboard locals
+    let localCounter = 0;
+
+    function emitStmt(st: Stmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, outArr: string[]) {
+      const withChain = withChainTo(outArr);
+      switch (st.kind) {
+        case "VarDecl": {
+          const b = baseOf(st.varType);
+          const isLocal = !st.isGlobal;
+
+          if (isArrayKind(st.varType)) {
+            if (st.init.kind === "Array") {
+              const cmds = arrayInitCommands(p.namespace, st.name, st.varType, st.init.items, d => diagnostics.push(d));
+              cmds.forEach(c => withChain(chain, c));
+            } else {
+              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value []`);
+            }
+            envTypes[st.name] = st.varType;
+            return;
+          }
+
+          if (b === "string") {
+            const lit = isStaticString(st.init) ? evalStaticString(st.init)! : "";
+            withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(lit)}`);
+            envTypes[st.name] = st.varType;
+            return;
+          }
+
+          if (b === "Ent") {
+            if (st.init.kind === "CallExpr" && (st.init.target || "").toLowerCase() === "ent" && st.init.name.toLowerCase() === "get" && st.init.args[0]?.kind === "String") {
+              const selector = `@e[limit=1,${(st.init.args[0] as StringExpr).value}]`;
+              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(selector)}`);
+            } else if (st.init.kind === "String" && !st.init.value.startsWith("$")) {
+              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(st.init.value)}`);
+            } else {
+              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ""`);
+            }
+            envTypes[st.name] = st.varType;
+            return;
+          }
+
+          if (isStoredNumericKind(st.varType)) {
+            const resolveScore = (name: string) => (localScores && name in localScores) ? localScores[name] : scoreName(p.namespace, name);
+            const tmp = compileNumericExpr(st.init, p.namespace, (c)=>outArr.push(tokensToPref(chain)(c)), { n: 0 }, resolveScore, (n)=>envTypes[n], diagnostics);
+
+            // allocate local scoreboard slot if needed
+            let target = scoreName(p.namespace, st.name);
+            if (isLocal) {
+              if (localScores) {
+                localScores[st.name] = localScores[st.name] ?? `__local_${localCounter++}_${st.name}`;
+                target = localScores[st.name];
               }
             }
+
+            withChain(chain, `scoreboard players operation ${target} vars = ${tmp} vars`);
+            const stype = storageTypeFor(st.varType);
+            withChain(chain, `execute store result storage ${p.namespace}:variables ${st.name} ${stype} 1 run scoreboard players get ${target} vars`);
+            envTypes[st.name] = st.varType;
+            return;
           }
-          const pack = symbols.packs[packId];
-          if (pack) {
-            for (const fn of Array.from(pack.funcs)) {
-              suggestions.push({ label: fn, kind: monaco.languages.CompletionItemKind.Function, insertText: `${fn}()`, detail: `${packId}:${fn}` });
-            }
-          }
-        } else {
-          for (const [pid, s] of Object.entries(symbols.packs)) {
-            for (const fn of Array.from(s.funcs)) suggestions.push({ label: `${pid}.${fn}`, kind: monaco.languages.CompletionItemKind.Function, insertText: `${pid}.${fn}()` });
-            for (const v of Array.from(s.vars)) suggestions.push({ label: v, kind: monaco.languages.CompletionItemKind.Variable, insertText: v });
-          }
+
+          diagnostics.push({ severity: "Error", message: `Unsupported local variable type '${b}'`, line: st.line, col: st.col });
+          return;
         }
 
-        return { suggestions };
-      },
-    });
+        case "Assign": return emitAssign(st, chain, localScores, envTypes, outArr);
+        case "Say":    return emitSay(st.expr, chain, localScores, envTypes, outArr);
+        case "Run":    return emitRun(st.expr, chain, localScores, envTypes, outArr);
+        case "Call": {
+          const tns = st.targetPack ?? p.namespace;
+          withChainTo(outArr)(chain, `function ${tns}:${st.func.toLowerCase()}`);
+          return;
+        }
+        case "Execute": return emitExecute(st, chain, localScores, envTypes, outArr);
+        case "If": return emitIfChain(st, chain, localScores, envTypes, outArr);
+        case "For": return emitFor(st, chain, envTypes, outArr);
+      }
+    }
 
-    return () => disp.dispose();
-  }, [monacoRef, symbols]);
-}
+    // ---- Emit functions ----
+    for (const f of p.functions) {
+      const out: string[] = [];
+      const localScores: Record<string, string> = {};
+      const envTypes: Record<string, VarKind> = { ...packVarTypes[p.namespace] };
+      for (const st of f.body) emitStmt(st, "", localScores, envTypes, out);
+      files.push({ path: `data/${p.namespace}/function/${f.name}.mcfunction`, contents: out.join("\n") + (out.length ? "\n" : "") });
+    }
 
-// ---------- UI Helpers ----------
-type TreeNode = { name: string; path?: string; children?: Record<string, TreeNode>; isDir: boolean };
-function buildTree(files: GeneratedFile[]): TreeNode {
-  const root: TreeNode = { name: "", isDir: true, children: {} };
-  for (const f of files) {
-    const parts = f.path.split("/");
-    let cur = root;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const isDir = i < parts.length - 1;
-      const key = part;
-      cur.children = cur.children || {};
-      if (!cur.children[key]) cur.children[key] = { name: part, isDir, children: isDir ? {} : undefined, path: !isDir ? f.path : undefined };
-      cur = cur.children[key]!;
+    // ---- Advancements ----
+    for (const a of p.advs) {
+      const advObj: any = {
+        display: {
+          title: a.props.title ?? a.name,
+          description: a.props.description ?? "",
+          icon: a.props.icon ? { item: a.props.icon } : { item: "minecraft:paper" },
+          frame: "task",
+          show_toast: true,
+          announce_to_chat: false,
+          hidden: false,
+        },
+        criteria: {} as Record<string, any>,
+      };
+      if (a.props.parent) advObj.parent = a.props.parent;
+      for (const c of a.props.criteria) advObj.criteria[c.name] = { trigger: c.trigger };
+      files.push({ path: `data/${p.namespace}/advancements/${a.name}.json`, contents: JSON.stringify(advObj, null, 2) + "\n" });
+    }
+
+    // ---- Recipes ----
+    for (const r of p.recipes) {
+      let body: any;
+      if (r.type === "shaped") {
+        body = {
+          type: "minecraft:crafting_shaped",
+          pattern: r.pattern ?? ["   ","   ","   "],
+          key: Object.fromEntries(Object.entries(r.keys ?? {}).map(([k,v]) => [k, { item: v }])),
+          result: r.result?.id?.includes(":") ? { item: r.result.id, count: r.result.count ?? 1 } : { item: `${p.namespace}:${r.result?.id}`, count: r.result?.count ?? 1 }
+        };
+      } else {
+        body = {
+          type: "minecraft:crafting_shapeless",
+          ingredients: (r.ingredients ?? []).map(i => ({ item: i })),
+          result: r.result?.id?.includes(":") ? { item: r.result.id, count: r.result.count ?? 1 } : { item: `${p.namespace}:${r.result?.id}`, count: r.result?.count ?? 1 }
+        };
+      }
+      files.push({ path: `data/${p.namespace}/recipes/${r.name}.json`, contents: JSON.stringify(body, null, 2) + "\n" });
+    }
+
+    // ---- Items ----
+    for (const it of p.items) {
+      const comps = componentTokensToMap(it.componentTokens) ?? {};
+      const body = { base: it.baseId, components: comps };
+      files.push({ path: `data/${p.namespace}/items/${it.name}.json`, contents: JSON.stringify(body, null, 2) + "\n" });
+      // convenience giver
+      files.push({
+        path: `data/${p.namespace}/function/give.${it.name}.mcfunction`,
+        contents: `give @s ${it.baseId}\n`,
+      });
+    }
+
+    // ---- Tags ----
+    for (const t of p.tags) {
+      const body = { replace: !!t.replace, values: t.values ?? [] };
+      files.push({ path: `data/${p.namespace}/tags/${t.category}/${t.name}.json`, contents: JSON.stringify(body, null, 2) + "\n" });
     }
   }
-  return root;
-}
 
-function FileTreeNode({
-  node, selected, onSelect
-}: { node: TreeNode; selected?: string; onSelect: (p: string) => void }) {
-  const [open, setOpen] = useState(true);
-  if (!node.isDir) {
-    return (
-      <div className="pl-6">
-        <button
-          onClick={() => node.path && onSelect(node.path)}
-          className={`w-full text-left px-2 py-1 rounded-md text-sm ${selected === node.path ? "bg-neutral-800 border border-neutral-700" : "hover:bg-neutral-800/60"}`}>
-          <span className="mr-2">📄</span><code className="break-all">{node.name}</code>
-        </button>
-      </div>
-    );
+  // Hook into load/tick based on presence
+  const loadVals: string[] = [];
+  const tickVals: string[] = [];
+  for (const p of ast.packs) {
+    loadVals.push(`${p.namespace}:__bootstrap`, `${p.namespace}:__init`);
+    if (p.functions.some(f => f.name === "load")) loadVals.push(`${p.namespace}:load`);
+    if (p.functions.some(f => f.name === "tick")) tickVals.push(`${p.namespace}:tick`);
   }
-  const entries = Object.values(node.children || {}).sort((a,b) => (a.isDir === b.isDir) ? a.name.localeCompare(b.name) : (a.isDir ? -1 : 1));
-  return (
-    <div>
-      {node.name !== "" && (
-        <button
-          onClick={() => setOpen(!open)}
-          className="w-full text-left px-2 py-1 rounded-md text-sm hover:bg-neutral-800/60">
-          <span className="mr-2">{open ? "📂" : "📁"}</span><span>{node.name}</span>
-        </button>
-      )}
-      {open && entries.map((child) => (
-        <div key={(child.path || child.name) + Math.random()}>
-          <FileTreeNode node={child} selected={selected} onSelect={onSelect} />
-        </div>
-      ))}
-    </div>
-  );
+  if (loadVals.length) files.push({ path: `data/minecraft/tags/functions/load.json`, contents: JSON.stringify({ values: Array.from(new Set(loadVals)) }, null, 2) + "\n" });
+  if (tickVals.length) files.push({ path: `data/minecraft/tags/functions/tick.json`, contents: JSON.stringify({ values: Array.from(new Set(tickVals)) }, null, 2) + "\n" });
+
+  return { files, diagnostics, symbolIndex };
 }
 
-function FileTree({
-  files, selected, onSelect
-}: { files: GeneratedFile[]; selected?: string; onSelect: (p: string) => void }) {
-  const tree = useMemo(() => buildTree(files), [files]);
-  return <div className="overflow-auto h-full pr-1"><FileTreeNode node={tree} selected={selected} onSelect={onSelect} /></div>;
-}
-
-function DiagnosticsPanel({ diags }: { diags: Diagnostic[] }) {
-  if (!diags.length) return (
-    <div className="text-sm text-emerald-400 flex items-center gap-2">
-      <span>✓</span> No diagnostics.
-    </div>
-  );
-  return (
-    <div className="space-y-2">
-      {diags.map((d, i) => (
-        <div key={i} className={`rounded-xl p-3 border ${d.severity === "Error" ? "border-red-500/40 bg-red-500/10" : d.severity === "Warning" ? "border-amber-500/40 bg-amber-500/10" : "border-sky-500/40 bg-sky-500/10"} text-neutral-200`}>
-          <div className="flex items-center justify-between">
-            <div className="text-xs uppercase tracking-wide opacity-70">{d.severity}</div>
-            <div className="text-xs opacity-70">Line {d.line}, Col {d.col}</div>
-          </div>
-          <div className="text-sm font-medium mt-1">{d.message}</div>
-        </div>
-      ))}
-    </div>
-  );
+// ---------- Driver (lex/parse/generate) ----------
+function compileSource(src: string) {
+  let diagnostics: Diagnostic[] = [];
+  let files: GeneratedFile[] = [];
+  let symbols: SymbolIndex = { packs: {} };
+  try {
+    const tokens = lex(src);
+    const { ast, diagnostics: d1 } = parse(tokens);
+    diagnostics = diagnostics.concat(d1);
+    if (ast) {
+      const gen = generate(ast);
+      files = gen.files;
+      diagnostics = diagnostics.concat(gen.diagnostics);
+      symbols = gen.symbolIndex;
+    }
+  } catch (e: any) {
+    diagnostics.push({ severity: "Error", message: e?.message ?? "Unknown error", line: 0, col: 0 });
+  }
+  return { files, diagnostics, symbols };
 }
 
 // ---------- UI ----------
-const DEFAULT_SOURCE = `pack "Hello World" namespace helloWorld{
 
-  func Load(){
-    Say("Hello World")
-  }
+type FileNode = { path: string; contents: string };
 
-  func Tick(){
-
-  }
-
-}
-
-pack "Fizz Buzz" namespace FizzBuzz{
-
-  func Load(){}
-
-  func Tick(){}
-
-  func FizzBuzz(){
-    for (var i = 1 | i < 31 | i++){
-      if(i % 3 == 0 && i % 5 == 0){
-        Say("FizzBuzz")
-      }else if(i % 3 == 0){
-        Say("Fizz")
-      }else if(i % 5 == 0){
-        Say("Buzz")
-      }else{
-        Say(i)
-      }
-    }
-  }
-}
-
-pack "Items + Recipes + Tags" namespace zombieSpawn{
-
-  Item emerald_sword{
-    base_id = "minecraft:wooden_sword";
-    components: [
-      minecraft:item_model="zombiespawn:emerald_sword",
-      minecraft:item_name="Emerald Sword"
-    ];
-  }
-
-  recipe emerald_sword{
-    type shaped;
-    pattern [
-      " A ",
-      " A ",
-      " B ",
-    ];
-    key A = minecraft:emerald;
-    key B = minecraft:stick;
-    // Use custom item as result -> pulls base_id + components
-    result zombiespawn.emerald_sword 1;
-  }
-
-  BlockTag Solid{
-    replace = true;
-    values:[
-      "minecraft:stone",
-      "minecraft:air"
-    ];
-  }
-
-  func Load(){
-    give.emerald_sword()
-  }
-
-  func Tick(){}
-}
-`;
-
-function useDebounced<T>(value: T, delay = 250) {
-  const [v, setV] = useState(value);
-  const t = useRef<number | null>(null);
+function useDebounced<T>(val: T, delay = 250) {
+  const [v, setV] = useState(val);
   useEffect(() => {
-    if (t.current !== null) window.clearTimeout(t.current);
-    t.current = window.setTimeout(() => setV(value), delay);
-    return () => { if (t.current !== null) window.clearTimeout(t.current); };
-  }, [value, delay]);
+    const id = setTimeout(() => setV(val), delay);
+    return () => clearTimeout(id);
+  }, [val, delay]);
   return v;
 }
 
-export default function WebDatapackCompiler() {
-  const monaco = useMonaco();
-  const editorRef = useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
+const DEFAULT_SOURCE = `pack "Typed Demo" namespace typedemo{
 
-  const [source, setSource] = useState<string>(DEFAULT_SOURCE);
-  const debouncedSource = useDebounced(source, 300);
-  const [compiled, setCompiled] = useState<{ files: GeneratedFile[]; diagnostics: Diagnostic[]; symbolIndex: SymbolIndex }>({ files: [], diagnostics: [], symbolIndex: { packs: {} } });
-  const [selectedPath, setSelectedPath] = useState<string | undefined>(undefined);
+  // Global typed variable
+  global Ent test;
 
-  useDslLanguage(monaco, compiled.symbolIndex);
-
-  // Compile on change
-  useEffect(() => {
-    const res = compile(debouncedSource);
-    setCompiled(res);
-    if (res.files.length && !selectedPath) setSelectedPath(res.files[0].path);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSource]);
-
-  // Push diagnostics to Monaco markers (squigglies + red/yellow dots)
-  useEffect(() => {
-    if (!monaco || !editorRef.current) return;
-    const model = editorRef.current.getModel();
-    if (!model) return;
-
-    const markers = compiled.diagnostics.map(d => ({
-      severity: d.severity === "Error" ? monaco.MarkerSeverity.Error :
-                d.severity === "Warning" ? monaco.MarkerSeverity.Warning :
-                monaco.MarkerSeverity.Info,
-      message: d.message,
-      startLineNumber: Math.max(1, d.line || 1),
-      startColumn: Math.max(1, d.col || 1),
-      endLineNumber: Math.max(1, d.line || 1),
-      endColumn: Math.max(1, (d.col || 1) + 1),
-      source: "DatapackDSL",
-    }));
-    monaco.editor.setModelMarkers(model, "DatapackDSL", markers);
-  }, [compiled.diagnostics, monaco]);
-
-  const onMount: OnMount = (editor, monacoInstance) => {
-    editorRef.current = editor;
-    // pleasant defaults + make errors stand out
-    editor.updateOptions({
-      fontSize: 14,
-      minimap: { enabled: false },
-      wordWrap: "on",
-      automaticLayout: true,
-      fontLigatures: true,
-      renderValidationDecorations: "on",
-      guides: { indentation: true, bracketPairs: true },
-      smoothScrolling: true,
-      scrollBeyondLastLine: false
-    });
-
-    // initial markers
-    const model = editor.getModel();
-    if (model) {
-      monacoInstance.editor.setModelMarkers(model, "DatapackDSL", []);
-    }
-  };
-
-  async function downloadZip() {
-    if (!compiled.files.length) return;
-    const zip = new JSZip();
-    for (const f of compiled.files) zip.file(f.path, f.contents);
-    const blob = await zip.generateAsync({ type: "blob" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "datapack.zip";
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+  func Load(){
+    // pick nearest player entity selector and store as literal selector string
+    test = Ent.Get("type=player,sort=nearest");
+    Say($"Loaded. Using selector {test}");
   }
 
-  // File selection
-  const selectedFile = useMemo(() => compiled.files.find(f => f.path === selectedPath), [compiled.files, selectedPath]);
+  func Tick(){
+    // int math + Random
+    int r = Random.value(1, 10);
+    int a = Math.Min(r, 3);
+    if (a == 3 && r >= 5) {
+      Run($"/title @a actionbar Random={r} a={a}")
+    }
+
+    // arrays of ints and strings
+    int[] nums = [1,2,3,4];
+    string[] names = ["Alex","Steve"];
+
+    // simple loop
+    for (int i = 0 | i < 3 | i++){
+      Say($"Loop i={i}")
+    }
+  }
+}
+`;
+
+export default function DatapackStudio() {
+  const [code, setCode] = useState<string>(DEFAULT_SOURCE);
+  const debounced = useDebounced(code, 200);
+  const monaco = useMonaco();
+  const [files, setFiles] = useState<FileNode[]>([]);
+  const [problems, setProblems] = useState<Diagnostic[]>([]);
+  const [selectedPath, setSelectedPath] = useState<string>("");
+  const editorRef = useRef<any>(null);
+
+  useEffect(() => {
+    const { files, diagnostics } = compileSource(debounced);
+    setFiles(files);
+    setProblems(diagnostics);
+    if (!selectedPath && files.length) setSelectedPath(files[0].path);
+
+    // push markers into Monaco
+    const model = editorRef.current?.getModel?.();
+    if (monaco && model) {
+      const markers = diagnostics.map(d => ({
+        startLineNumber: Math.max(1, d.line || 1),
+        startColumn: Math.max(1, d.col || 1),
+        endLineNumber: Math.max(1, d.line || 1),
+        endColumn: Math.max(1, (d.col || 1) + 1),
+        message: d.message,
+        severity: d.severity === "Error" ? monaco.MarkerSeverity.Error :
+                  d.severity === "Warning" ? monaco.MarkerSeverity.Warning :
+                  monaco.MarkerSeverity.Info,
+        source: "typed-datapack"
+      }));
+      monaco.editor.setModelMarkers(model, "typed-datapack", markers);
+    }
+  }, [debounced, monaco, selectedPath]);
+
+  const onMount: OnMount = (editor) => {
+    editorRef.current = editor;
+  };
+
+  const selectedFile = files.find(f => f.path === selectedPath);
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-200">
-      <div className="mx-auto max-w-7xl p-6">
-        <header className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-3">
-            <div className="h-9 w-9 rounded-md bg-indigo-500 text-white grid place-items-center font-bold">DP</div>
-            <div>
-              <h1 className="text-xl font-semibold tracking-tight">Datapack Web Compiler</h1>
-              <p className="text-xs text-neutral-400">Globals • Execute • for/if • &&/|| • Items • Tags • Adv/Recipes • IntelliSense • Zip export</p>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={downloadZip} disabled={!compiled.files.length} className="px-4 py-2 rounded-md border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 disabled:opacity-50">Download .zip</button>
-          </div>
-        </header>
+    <div style={{ display: "grid", gridTemplateColumns: "240px 1fr", gridTemplateRows: "1fr 180px", height: "100vh", background: "#111" }}>
+      {/* File tree */}
+      <div style={{ gridColumn: "1 / 2", gridRow: "1 / 3", borderRight: "1px solid #333", overflow: "auto", padding: 8, color: "#ddd" }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Files</div>
+        {files.length === 0 ? (
+          <div style={{ color: "#777" }}>No files (fix errors or type something)</div>
+        ) : (
+          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+            {files.map(f => (
+              <li key={f.path} style={{ margin: "2px 0" }}>
+                <button
+                  onClick={() => setSelectedPath(f.path)}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    background: selectedPath === f.path ? "#1e1e1e" : "transparent",
+                    border: "1px solid #333",
+                    borderRadius: 6,
+                    padding: "6px 8px",
+                    color: "#ddd",
+                    cursor: "pointer"
+                  }}
+                >
+                  {f.path}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
 
-        {/* Editor + Output */}
-        <div className="grid grid-cols-1 lg:grid-cols-[2fr,1fr] gap-6">
-          {/* Editor + diagnostics */}
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-medium text-neutral-300">Source</label>
-            <div className="rounded-xl overflow-hidden border border-neutral-800 shadow-inner">
-              <Editor
-                height="620px"
-                language="datapackdsl"
-                theme="vs-dark"
-                value={source}
-                onMount={onMount}
-                onChange={(v) => setSource(v ?? "")}
-                options={{
-                  fontSize: 14,
-                  minimap: { enabled: false },
-                  wordWrap: "on",
-                  automaticLayout: true,
-                  fontLigatures: true,
-                }}
-              />
-            </div>
-            <div className="mt-2">
-              <label className="text-sm font-medium text-neutral-300">Problems</label>
-              <div className="mt-2"><DiagnosticsPanel diags={compiled.diagnostics} /></div>
-            </div>
-          </div>
-
-          {/* File tree + viewer */}
-          <div className="flex flex-col gap-3">
-            <div className="grid grid-rows-[260px,1fr] gap-3">
-              <div className="border rounded-xl p-3 border-neutral-800 bg-neutral-900">
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-medium text-neutral-300">Generated Files</label>
-                </div>
-                <div className="h-[210px]"><FileTree files={compiled.files} selected={selectedPath} onSelect={setSelectedPath} /></div>
-              </div>
-
-              <div className="border rounded-xl p-3 border-neutral-800 bg-neutral-900 overflow-auto">
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-medium text-neutral-300">{selectedPath ?? "No file selected"}</label>
-                </div>
-                {selectedFile ? (
-                  <pre className="font-mono text-sm whitespace-pre-wrap break-words text-neutral-200">{selectedFile.contents}</pre>
-                ) : (
-                  <div className="text-sm text-neutral-400">Select a file from the tree to preview its contents.</div>
-                )}
-              </div>
-            </div>
-
-            <div className="text-xs text-neutral-400 mt-1 space-y-1">
-              <p><b>Items:</b> <code>Item emerald_sword {'{'} base_id = "minecraft:wooden_sword"; components: [ minecraft:item_model="zombieSpawn:emerald_sword" ]; {'}'}</code> → <code>function &lt;ns&gt;:give/emerald_sword</code> or <code>give.emerald_sword()</code></p>
-              <p><b>Macros:</b> <code>Say($&quot;Hello {'{'}i{'}'}&quot;)</code>, <code>Run($&quot;summon ~{'{'}x{'}'} ~ ~{'{'}z{'}'}&quot;)</code> — executed with <code>with storage &lt;ns&gt;:variables</code>.</p>
-              <p><b>for:</b> <code>for (var i = 0 | i &lt; 10 | i++)</code> or <code>for (num | num &lt; 10 | num++)</code></p>
-              <p><b>Tags:</b> <code>BlockTag Solid {'{'} replace = true; values:[ "minecraft:stone" ]; {'}'}</code> → <code>data/&lt;ns&gt;/tags/blocks/solid.json</code></p>
-            </div>
-          </div>
+      {/* Editor + Preview */}
+      <div style={{ gridColumn: "2 / 3", gridRow: "1 / 2", display: "grid", gridTemplateRows: "1fr 40%", gap: 8, padding: 8 }}>
+        <div style={{ border: "1px solid #333" }}>
+          <Editor
+            height="100%"
+            defaultLanguage="plaintext"
+            theme="vs-dark"
+            value={code}
+            onChange={(v) => setCode(v ?? "")}
+            onMount={onMount}
+            options={{
+              fontSize: 14,
+              minimap: { enabled: false },
+              scrollBeyondLastLine: false,
+              wordWrap: "on",
+            }}
+          />
         </div>
 
-        <footer className="mt-8 text-xs text-neutral-500">
-          Pack format: 48. Drop the zip into <code>%APPDATA%\.minecraft\saves\&lt;World&gt;\datapacks</code>.
-        </footer>
+        {/* Preview of selected file */}
+        <div style={{ border: "1px solid #333", overflow: "auto", background: "#0b0b0b" }}>
+          <div style={{ padding: "6px 8px", borderBottom: "1px solid #222", color: "#bbb", display: "flex", justifyContent: "space-between" }}>
+            <div>Preview: <code>{selectedFile?.path || "(none)"}</code></div>
+            <div>{files.length} files</div>
+          </div>
+          <pre style={{ margin: 0, padding: 12, whiteSpace: "pre-wrap", color: "#ddd" }}>{selectedFile?.contents ?? ""}</pre>
+        </div>
+      </div>
+
+      {/* Problems panel */}
+      <div style={{ gridColumn: "2 / 3", gridRow: "2 / 3", borderTop: "1px solid #333", background: "#141414", color: "#ddd", overflow: "auto" }}>
+        <div style={{ padding: "6px 8px", borderBottom: "1px solid #222", display: "flex", justifyContent: "space-between" }}>
+          <div>Problems</div>
+          <div>{problems.length}</div>
+        </div>
+        {problems.length === 0 ? (
+          <div style={{ padding: 8, color: "#7aa06a" }}>No problems</div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: "#1c1c1c" }}>
+                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Severity</th>
+                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Message</th>
+                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Line</th>
+                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Col</th>
+              </tr>
+            </thead>
+            <tbody>
+              {problems.map((p, i) => (
+                <tr key={i} style={{ borderBottom: "1px solid #222" }}>
+                  <td style={{ padding: 6, color: p.severity === "Error" ? "#ff6b6b" : p.severity === "Warning" ? "#ffd56b" : "#7aa0ff" }}>{p.severity}</td>
+                  <td style={{ padding: 6 }}>{p.message}</td>
+                  <td style={{ padding: 6 }}>{p.line ?? 0}</td>
+                  <td style={{ padding: 6 }}>{p.col ?? 0}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
