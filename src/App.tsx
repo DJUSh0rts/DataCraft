@@ -1106,6 +1106,9 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
         envTypes: Record<string, VarKind>,
         outArr: string[]
       ) => {
+
+        void outArr;
+        
         const withChain = withChainTo(outArr);
         const makePref = tokensToPref(chain);
         const resolveVar = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
