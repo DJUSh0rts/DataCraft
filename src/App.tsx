@@ -1301,16 +1301,35 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       }
 
       if (b === "Ent") {
-        if (g.init.kind === "CallExpr" && (g.init.target || "").toLowerCase() === "ent" && g.init.name.toLowerCase() === "get" && g.init.args[0]?.kind === "String") {
-          const selector = `@e[limit=1,${(g.init.args[0] as StringExpr).value}]`;
-          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(selector)}`);
-        } else if (g.init.kind === "String" && !g.init.value.startsWith("$")) {
-          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(g.init.value)}`);
-        } else {
-          init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ""`);
-        }
-        continue;
-      }
+  if (
+    g.init.kind === "CallExpr" &&
+    (g.init.target || "").toLowerCase() === "ent" &&
+    g.init.name.toLowerCase() === "get" &&
+    g.init.args[0]?.kind === "String"
+  ) {
+    const selector = `@e[limit=1,${(g.init.args[0] as StringExpr).value}]`;
+    init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(selector)}`);
+
+    // NEW: also bind the UUID bucket for this variable
+    init.push(`execute as ${selector} run function ${p.namespace}:__ent_bind_${g.name} with storage ${p.namespace}:variables entity @s`);
+    // ensure the binder function exists
+    const fpath = `data/${p.namespace}/function/__ent_bind_${g.name}.mcfunction`;
+    if (!files.some(f => f.path === fpath)) {
+      files.push({
+        path: fpath,
+        contents: `$data merge storage ${p.namespace}:variables {${g.name}:{uuid:"$(UUID)"}}\n`,
+      });
+    }
+  } else if (g.init.kind === "String" && !g.init.value.startsWith("$")) {
+    init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ${JSON.stringify(g.init.value)}`);
+    // optional: no binder when no selector context
+  } else {
+    init.push(`data modify storage ${p.namespace}:variables ${g.name} set value ""`);
+  }
+  continue;
+}
+
+
 
       if (isStoredNumericKind(kind)) {
         if (b === "int" || b === "bool") {
@@ -1340,6 +1359,32 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
 
     const tokensToPref = (chain: string) => (cmd: string) => (chain ? `execute ${chain} run ${cmd}` : cmd);
     const withChainTo = (sink: string[]) => (chain: string, cmd: string) => sink.push(tokensToPref(chain)(cmd));
+
+
+    // --- ADD: helper to create & call the per-var binder under entity context ---
+function emitEntBindForVar(
+  varName: string,
+  chain: string,
+  outArr: string[],
+  namespace: string,
+  filesArr: GeneratedFile[]
+) {
+  const withChain = withChainTo(outArr);
+  const fname = `__ent_bind_${varName}`;
+  const fpath = `data/${namespace}/function/${fname}.mcfunction`;
+
+  // ensure the one-liner macro func exists
+  if (!filesArr.some(f => f.path === fpath)) {
+    filesArr.push({
+      path: fpath,
+      contents: `$data merge storage ${namespace}:variables {${varName}:{uuid:"$(UUID)"}}\n`,
+    });
+  }
+
+  // call it in the current entity context so $(UUID) resolves
+  withChain(chain, `function ${namespace}:${fname} with storage ${namespace}:variables entity @s`);
+}
+
 
     function condToVariants(
       cond: Condition | null | undefined,
@@ -1490,17 +1535,35 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
       }
 
       if (b === "Ent") {
-        if (assign.op !== "=") { diagnostics.push({ severity: "Error", message: `Only '=' supported for Ent`, line: assign.line, col: assign.col }); return; }
-        if (assign.expr.kind === "CallExpr" && (assign.expr.target || "").toLowerCase() === "ent" && assign.expr.name.toLowerCase() === "get" && assign.expr.args[0]?.kind === "String") {
-          const selector = `@e[limit=1,${(assign.expr.args[0] as StringExpr).value}]`;
-          withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(selector)}`);
-        } else if (assign.expr.kind === "String") {
-          withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(assign.expr.value)}`);
-        } else {
-          diagnostics.push({ severity: "Error", message: `Ent assignment must be Ent.Get("...") or a selector string`, line: assign.line, col: assign.col });
-        }
-        return;
-      }
+  if (assign.op !== "=") {
+    diagnostics.push({ severity: "Error", message: `Only '=' supported for Ent`, line: assign.line, col: assign.col });
+    return;
+  }
+  if (
+    assign.expr.kind === "CallExpr" &&
+    (assign.expr.target || "").toLowerCase() === "ent" &&
+    assign.expr.name.toLowerCase() === "get" &&
+    assign.expr.args[0]?.kind === "String"
+  ) {
+    const selector = `@e[limit=1,${(assign.expr.args[0] as StringExpr).value}]`;
+    withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(selector)}`);
+
+    // NEW: bind UUID under this variable name (entity context)
+    emitEntBindForVar(assign.name, [chain, `as ${selector}`].filter(Boolean).join(" "), outArr, p.namespace, files);
+  } else if (assign.expr.kind === "String") {
+    withChain(chain, `data modify storage ${p.namespace}:variables ${assign.name} set value ${JSON.stringify(assign.expr.value)}`);
+    // (no binder when not selecting an entity)
+  } else {
+    diagnostics.push({
+      severity: "Error",
+      message: `Ent assignment must be Ent.Get("...") or a selector string`,
+      line: assign.line,
+      col: assign.col
+    });
+  }
+  return;
+}
+
 
       if (isStoredNumericKind(kind)) {
         const resolveScore = (name: string) => localScores && name in localScores ? localScores[name] : scoreName(p.namespace, name);
@@ -1638,17 +1701,26 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
           }
 
           if (b === "Ent") {
-            if (st.init.kind === "CallExpr" && (st.init.target || "").toLowerCase() === "ent" && st.init.name.toLowerCase() === "get" && st.init.args[0]?.kind === "String") {
-              const selector = `@e[limit=1,${(st.init.args[0] as StringExpr).value}]`;
-              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(selector)}`);
-            } else if (st.init.kind === "String" && !st.init.value.startsWith("$")) {
-              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(st.init.value)}`);
-            } else {
-              withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ""`);
-            }
-            envTypes[st.name] = st.varType;
-            return;
-          }
+  if (
+    st.init.kind === "CallExpr" &&
+    (st.init.target || "").toLowerCase() === "ent" &&
+    st.init.name.toLowerCase() === "get" &&
+    st.init.args[0]?.kind === "String"
+  ) {
+    const selector = `@e[limit=1,${(st.init.args[0] as StringExpr).value}]`;
+    withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(selector)}`);
+
+    // NEW: bind UUID under this variable name (entity context)
+    emitEntBindForVar(st.name, [chain, `as ${selector}`].filter(Boolean).join(" "), outArr, p.namespace, files);
+  } else if (st.init.kind === "String" && !st.init.value.startsWith("$")) {
+    withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ${JSON.stringify(st.init.value)}`);
+  } else {
+    withChain(chain, `data modify storage ${p.namespace}:variables ${st.name} set value ""`);
+  }
+  envTypes[st.name] = st.varType;
+  return;
+}
+
 
           if (isStoredNumericKind(st.varType)) {
             const resolveScore = (name: string) => (localScores && name in localScores) ? localScores[name] : scoreName(p.namespace, name);
