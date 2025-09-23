@@ -1,33 +1,38 @@
-// src/compiler/compile.ts
-import type { GeneratedFile, Diagnostic, Script } from "./types";
 import { lex } from "./lexer";
 import { parse } from "./parser";
-import { generate } from "./generator";
+import { generate } from "./generate";
+import type { Diagnostic, GeneratedFile, SymbolIndex } from "./types";
 
-export function compile(source: string): {
+/**
+ * Top-level compile driver: src -> tokens -> AST -> files
+ */
+export function compile(src: string): {
   files: GeneratedFile[];
   diagnostics: Diagnostic[];
-  ast: Script;
+  symbols: SymbolIndex;
 } {
-  let files: GeneratedFile[] = [];
   let diagnostics: Diagnostic[] = [];
-  let ast: Script = { packs: [] };
+  let files: GeneratedFile[] = [];
+  let symbols: SymbolIndex = { packs: {} };
 
   try {
-    const tokens = lex(source);
-    const { ast: parsed, diagnostics: parseDiags } = parse(tokens);
-    ast = parsed;
-    const { files: genFiles, diagnostics: genDiags } = generate(ast);
-    files = genFiles;
-    diagnostics = [...parseDiags, ...genDiags];
+    const tokens = lex(src);
+    const { ast, diagnostics: pDiags } = parse(tokens);
+    diagnostics = diagnostics.concat(pDiags);
+    if (ast) {
+      const gen = generate(ast);
+      files = gen.files;
+      diagnostics = diagnostics.concat(gen.diagnostics);
+      symbols = gen.symbolIndex;
+    }
   } catch (e: any) {
     diagnostics.push({
       severity: "Error",
-      message: e?.message ?? "Unknown error during compile",
+      message: e?.message ?? "Unknown error",
       line: e?.line ?? 0,
       col: e?.col ?? 0,
     });
   }
 
-  return { files, diagnostics, ast };
+  return { files, diagnostics, symbols };
 }
