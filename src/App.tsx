@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./monaco-setup";
 import Editor, { useMonaco } from "@monaco-editor/react";
-import type { Monaco, OnMount } from "@monaco-editor/react";
+import type { OnMount } from "@monaco-editor/react";
 import "./basic-dark.css";
 import JSZip from "jszip";
 // add this near the top with your other imports
