@@ -1016,6 +1016,7 @@ function tokensToText(ts: Token[]): string {
   return out;
 }
 
+
 function renderMacroTemplate(src: string): { line: string; refs: string[] } {
   const refs: string[] = [];
   const line = src.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, g1) => {
