@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import "./monaco-setup";
 import Editor, { useMonaco } from "@monaco-editor/react";
-import type { OnMount } from "@monaco-editor/react";
+import type { Monaco, OnMount } from "@monaco-editor/react";
 import "./basic-dark.css";
+import JSZip from "jszip";
+// add this near the top with your other imports
+import * as monacoEditor from "monaco-editor";
+
+
 
 /**
  * Datapack Web Compiler (Typed)
@@ -1758,8 +1763,8 @@ function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Diagnosti
     if (p.functions.some(f => f.name === "load")) loadVals.push(`${p.namespace}:load`);
     if (p.functions.some(f => f.name === "tick")) tickVals.push(`${p.namespace}:tick`);
   }
-  if (loadVals.length) files.push({ path: `data/minecraft/tags/functions/load.json`, contents: JSON.stringify({ values: Array.from(new Set(loadVals)) }, null, 2) + "\n" });
-  if (tickVals.length) files.push({ path: `data/minecraft/tags/functions/tick.json`, contents: JSON.stringify({ values: Array.from(new Set(tickVals)) }, null, 2) + "\n" });
+  if (loadVals.length) files.push({ path: `data/minecraft/tags/function/load.json`, contents: JSON.stringify({ values: Array.from(new Set(loadVals)) }, null, 2) + "\n" });
+  if (tickVals.length) files.push({ path: `data/minecraft/tags/function/tick.json`, contents: JSON.stringify({ values: Array.from(new Set(tickVals)) }, null, 2) + "\n" });
 
   return { files, diagnostics, symbolIndex };
 }
@@ -1829,14 +1834,420 @@ const DEFAULT_SOURCE = `pack "Typed Demo" namespace typedemo{
 }
 `;
 
+function downloadDatapackZip(files: FileNode[], zipName = "datapack.zip") {
+  if (!files?.length) return;
+  const zip = new JSZip();
+  for (const f of files) {
+    zip.file(f.path, f.contents ?? "");
+  }
+  zip.generateAsync({ type: "blob" }).then((blob) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = zipName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+}
+
+
+
 export default function DatapackStudio() {
   const [code, setCode] = useState<string>(DEFAULT_SOURCE);
   const debounced = useDebounced(code, 200);
   const monaco = useMonaco();
+
+   // Register language + tokens + config + completions
+useEffect(() => {
+  if (!monaco) return;
+
+  // 1) Register language (idempotent)
+  try {
+    monaco.languages.register({ id: "datapack-lang" });
+  } catch {}
+
+  // 2) Monarch tokens (expanded)
+  monaco.languages.setMonarchTokensProvider("datapack-lang", {
+    tokenizer: {
+      root: [
+        // keywords / decls / stmts
+        [/\b(pack|namespace|global|func|for|if|else|unless|Execute|Say|Run|adv|recipe|item|BlockTag|ItemTag|type|key|pattern|ingredient|result|title|description|desc|icon|parent|criterion|replace|values|base_id|components)\b/, "keyword"],
+        // types
+        [/\b(int|bool|string|float|double|Ent)(\[\])?\b/, "type"],
+        // macro-strings $"..."
+        [/\$"(?:[^"\\]|\\.)*"/, "string"],
+        // normal strings
+        [/"/, { token: "string.quote", next: "@string" }],
+        // numbers
+        [/[0-9]+(?:\.[0-9]+)?/, "number"],
+        // comments
+        [/\/\/.*/, "comment"],
+        // punctuation
+        [/[{}()\[\];,.:]/, "delimiter"],
+        // operators
+        [/[+\-*\/%]=?/, "operator"],
+        [/==|!=|<=|>=|<|>|&&|\|\|/, "operator"],
+        // identifiers (allow @ and selector-ish chars)
+        [/[A-Za-z_@~^\[\]:.][A-Za-z0-9_@~^\[\]:.]*/, "identifier"],
+      ],
+      string: [
+        [/[^"\\]+/, "string"],
+        [/\\./, "string.escape"],
+        [/"/, { token: "string.quote", next: "@pop" }],
+      ],
+    },
+  });
+
+  // 3) Language configuration: brackets, auto-close, quotes, onEnter rules
+  monaco.languages.setLanguageConfiguration("datapack-lang", {
+    brackets: [
+      ["{", "}"],
+      ["[", "]"],
+      ["(", ")"],
+    ],
+    autoClosingPairs: [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+      { open: "(", close: ")" },
+      { open: '"', close: '"', notIn: ["string", "comment"] },
+    ],
+    surroundingPairs: [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+      { open: "(", close: ")" },
+      { open: '"', close: '"' },
+    ],
+    indentationRules: {
+      increaseIndentPattern: /.*\{[^}"']*$/,
+      decreaseIndentPattern: /^\s*\}.*$/,
+    },
+    onEnterRules: [
+  {
+    beforeText: /.*\{[^}"']*$/,
+    afterText: /^\s*\}.*$/,
+    action: { indentAction: monacoEditor.languages.IndentAction.IndentOutdent },
+  },
+  {
+    beforeText: /.*\{[^}"']*$/,
+    action: { indentAction: monacoEditor.languages.IndentAction.Indent },
+  },
+],
+
+    autoCloseBefore: ";:.,=}]) \n\t",
+  });
+
+  // 4) IntelliSense (completions) — strongly typed range & list
+  // 4) IntelliSense (completions) — strongly typed range & list
+monaco.languages.registerCompletionItemProvider("datapack-lang", {
+  triggerCharacters: [".", '"', "$", ":", "["],
+  provideCompletionItems: (
+    model,
+    position
+  ): monacoEditor.languages.ProviderResult<monacoEditor.languages.CompletionList> => {
+    const word = model.getWordUntilPosition(position);
+    const range: monacoEditor.IRange = {
+      startLineNumber: position.lineNumber,
+      startColumn: word.startColumn,
+      endLineNumber: position.lineNumber,
+      endColumn: word.endColumn,
+    };
+
+    const lineText = model.getLineContent(position.lineNumber);
+    const uptoCursor = lineText.slice(0, position.column - 1);
+
+    const asSnippet =
+      monacoEditor.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+
+    const suggestions: monacoEditor.languages.CompletionItem[] = [];
+
+    // Top-level keywords / snippets
+    suggestions.push(
+      {
+        label: "pack",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText: 'pack "${1:My Pack}" namespace ${2:myns}{\n\t$0\n}',
+        range,
+      },
+      {
+        label: "func",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText: "func ${1:Name}(){\n\t$0\n}",
+        range,
+      },
+      {
+        label: "global",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertText: "global int varName;",
+        range,
+      },
+      {
+        label: "if",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText:
+          "if (${1:a} == ${2:b}){\n\t$0\n} else {\n\t\n}",
+        range,
+      },
+      {
+        label: "unless",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText: "unless (${1:a} == ${2:b}){\n\t$0\n}",
+        range,
+      },
+      {
+        label: "for",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText:
+          "for (int ${1:i} = 0 | ${1:i} < ${2:10} | ${1:i}++){\n\t$0\n}",
+        range,
+      },
+      {
+        label: "Execute",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText: "Execute(){\n\t$0\n}",
+        range,
+      },
+      {
+        label: "Say",
+        kind: monacoEditor.languages.CompletionItemKind.Function,
+        insertTextRules: asSnippet,
+        insertText: 'Say($"${1:Hello} ${2:name}")',
+        range,
+      },
+      {
+        label: "Run",
+        kind: monacoEditor.languages.CompletionItemKind.Function,
+        insertTextRules: asSnippet,
+        insertText: 'Run($"/say ${1:hi}")',
+        range,
+      },
+      {
+        label: "adv",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText: "adv ${1:name}(){\n\t$0\n}",
+        range,
+      },
+      {
+        label: "recipe",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText:
+          'recipe ${1:name}(){\n\ttype shaped;\n\tpattern ["${2:ABC}","${3:DEF}","${4:GHI}"];\n\tkey A = ${5:minecraft:stone};\n\tresult ${6:minecraft:stone} 1;\n}',
+        range,
+      },
+      {
+        label: "item",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText:
+          "item ${1:name}(){\n\tbase_id: ${2:minecraft:stone};\n\tcomponents: [${3:key}=${4:value}];\n}",
+        range,
+      },
+      {
+        label: "BlockTag",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText:
+          'BlockTag ${1:name}(){\n\treplace: ${2:false};\n\tvalues: ["${3:minecraft:stone}"];\n}',
+        range,
+      },
+      {
+        label: "ItemTag",
+        kind: monacoEditor.languages.CompletionItemKind.Keyword,
+        insertTextRules: asSnippet,
+        insertText:
+          'ItemTag ${1:name}(){\n\treplace: ${2:false};\n\tvalues: ["${3:minecraft:stone}"];\n}',
+        range,
+      }
+    );
+
+    // Execute modifiers
+    ["as", "at", "positioned", "or"].forEach((m) =>
+      suggestions.push({
+        label: m,
+        kind: monacoEditor.languages.CompletionItemKind.Operator,
+        insertText: m,
+        range,
+      })
+    );
+
+    // Member completions after Math., Random., Ent.
+    const endsWith = (s: string) => uptoCursor.endsWith(s);
+
+    if (endsWith("Math.")) {
+      ["Min", "Max", "Pow", "Root", "PI"].forEach((name) =>
+        suggestions.push({
+          label: `Math.${name}`,
+          kind: monacoEditor.languages.CompletionItemKind.Function,
+          insertTextRules: asSnippet,
+          insertText:
+            name === "PI"
+              ? "PI()"
+              : name === "Pow"
+              ? "Pow(${1:base}, ${2:power})"
+              : name === "Root"
+              ? "Root(${1:value}, ${2:power})"
+              : name + "(${1:a}, ${2:b})",
+          range,
+        })
+      );
+    }
+
+    if (endsWith("Random.")) {
+      suggestions.push({
+        label: "Random.value",
+        kind: monacoEditor.languages.CompletionItemKind.Function,
+        insertTextRules: asSnippet,
+        insertText: "value(${1:min}, ${2:max})",
+        range,
+      });
+    }
+
+    if (endsWith("Ent.")) {
+      ["Get", "GetData"].forEach((name) =>
+        suggestions.push({
+          label: `Ent.${name}`,
+          kind: monacoEditor.languages.CompletionItemKind.Function,
+          insertTextRules: asSnippet,
+          insertText:
+            name === "Get"
+              ? 'Get("${1:type=player,limit=1}")'
+              : 'GetData(${1:ent}, "${2:Health}")',
+          range,
+        })
+      );
+    }
+
+    // Common block properties
+    [
+      "title",
+      "description",
+      "desc",
+      "icon",
+      "parent",
+      "criterion",
+      "type",
+      "ingredient",
+      "pattern",
+      "key",
+      "result",
+      "base_id",
+      "components",
+      "replace",
+      "values",
+    ].forEach((k) =>
+      suggestions.push({
+        label: k,
+        kind: monacoEditor.languages.CompletionItemKind.Property,
+        insertText: k,
+        range,
+      })
+    );
+
+    return { suggestions };
+  },
+});
+
+}, [monaco]);
+
+
   const [files, setFiles] = useState<FileNode[]>([]);
   const [problems, setProblems] = useState<Diagnostic[]>([]);
   const [selectedPath, setSelectedPath] = useState<string>("");
-  const editorRef = useRef<any>(null);
+  const editorRef = useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
+
+
+
+  
+
+  const [leftWidth, setLeftWidth] = useState<number>(() => {
+  const v = Number(localStorage.getItem("leftWidth"));
+  return Number.isFinite(v) && v >= 180 ? v : 220;  // was 280
+});
+
+const [bottomHeight, setBottomHeight] = useState<number>(() => {
+  const v = Number(localStorage.getItem("bottomHeight"));
+  return Number.isFinite(v) && v >= 120 ? v : 180;
+});
+
+// --- Height of the EDITOR area inside the right pane ---
+const [editorHeight, setEditorHeight] = useState<number>(() => {
+  const v = Number(localStorage.getItem("editorHeight"));
+  return Number.isFinite(v) && v >= 120 ? v : 400; // default ~400px
+});
+useEffect(() => localStorage.setItem("editorHeight", String(editorHeight)), [editorHeight]);
+
+
+
+useEffect(() => localStorage.setItem("leftWidth", String(leftWidth)), [leftWidth]);
+useEffect(() => localStorage.setItem("bottomHeight", String(bottomHeight)), [bottomHeight]);
+
+// dragging refs
+const dragging = useRef<null | "vert" | "horiz" | "editor">(null);
+
+
+useEffect(() => {
+  function onMove(e: MouseEvent) {
+  if (dragging.current === "vert") {
+    // min 200, max 60% viewport
+    const next = Math.min(Math.max(e.clientX, 200), window.innerWidth * 0.6);
+    setLeftWidth(next);
+  } else if (dragging.current === "horiz") {
+    const viewportH = window.innerHeight;
+    // bottom panel height from bottom drag-bar
+    const next = Math.min(Math.max(viewportH - e.clientY, 120), viewportH * 0.8);
+    setBottomHeight(next);
+  } else if (dragging.current === "editor") {
+    // resize the editor height inside the right pane
+    const paneTop =
+      (document.querySelector("#editorPane") as HTMLElement | null)?.getBoundingClientRect()
+        ?.top ?? 0;
+    // distance from top of the pane to the mouse
+    const next = Math.min(Math.max(e.clientY - paneTop, 120), window.innerHeight * 0.8);
+    setEditorHeight(next);
+  }
+}
+
+  function onUp() { dragging.current = null; document.body.style.userSelect = ""; document.body.style.cursor = ""; }
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  return () => {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+  };
+}, []);
+
+const startDragVert = () => { dragging.current = "vert"; document.body.style.userSelect = "none"; document.body.style.cursor = "col-resize"; };
+const startDragHoriz = () => { dragging.current = "horiz"; document.body.style.userSelect = "none"; document.body.style.cursor = "row-resize"; };
+
+const startDragEditor = () => {
+  dragging.current = "editor";
+  document.body.style.userSelect = "none";
+  document.body.style.cursor = "row-resize";
+};
+
+
+// Re-layout Monaco when sizes change
+useEffect(() => {
+  editorRef.current?.layout?.();
+}, [leftWidth, bottomHeight, editorHeight]);
+
+
+// Also do it on window resize (defensive)
+useEffect(() => {
+  const onResize = () => editorRef.current?.layout?.();
+  window.addEventListener("resize", onResize);
+  return () => window.removeEventListener("resize", onResize);
+}, []);
+
 
   useEffect(() => {
     const { files, diagnostics } = compileSource(debounced);
@@ -1845,121 +2256,319 @@ export default function DatapackStudio() {
     if (!selectedPath && files.length) setSelectedPath(files[0].path);
 
     // push markers into Monaco
-    const model = editorRef.current?.getModel?.();
-    if (monaco && model) {
-      const markers = diagnostics.map(d => ({
-        startLineNumber: Math.max(1, d.line || 1),
-        startColumn: Math.max(1, d.col || 1),
-        endLineNumber: Math.max(1, d.line || 1),
-        endColumn: Math.max(1, (d.col || 1) + 1),
-        message: d.message,
-        severity: d.severity === "Error" ? monaco.MarkerSeverity.Error :
-                  d.severity === "Warning" ? monaco.MarkerSeverity.Warning :
-                  monaco.MarkerSeverity.Info,
-        source: "typed-datapack"
-      }));
-      monaco.editor.setModelMarkers(model, "typed-datapack", markers);
-    }
+const model = editorRef.current?.getModel?.();
+if (monaco && model) {
+  const markers: monacoEditor.editor.IMarkerData[] = diagnostics.map((d) => ({
+    startLineNumber: Math.max(1, d.line || 1),
+    startColumn: Math.max(1, d.col || 1),
+    endLineNumber: Math.max(1, d.line || 1),
+    endColumn: Math.max(1, (d.col || 1) + 1),
+    message: d.message,
+    severity:
+      d.severity === "Error"
+        ? monacoEditor.MarkerSeverity.Error
+        : d.severity === "Warning"
+        ? monacoEditor.MarkerSeverity.Warning
+        : monacoEditor.MarkerSeverity.Info,
+    source: "typed-datapack",
+  }));
+
+  // Use module setter (safe for types) with the model instance you already have
+  monacoEditor.editor.setModelMarkers(model, "typed-datapack", markers);
+}
+
   }, [debounced, monaco, selectedPath]);
 
-  const onMount: OnMount = (editor) => {
-    editorRef.current = editor;
-  };
+  const onMount: OnMount = (editor, monacoInstance) => {
+  editorRef.current = editor;
+  // Ensure our custom language is applied even if the model is reused.
+  try {
+    const model = editor.getModel();
+    if (model && monacoInstance) {
+      monacoInstance.editor.setModelLanguage(model, "datapack-lang");
+    }
+  } catch {}
+};
+
+
 
   const selectedFile = files.find(f => f.path === selectedPath);
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "240px 1fr", gridTemplateRows: "1fr 180px", height: "100vh", background: "#111" }}>
-      {/* File tree */}
-      <div style={{ gridColumn: "1 / 2", gridRow: "1 / 3", borderRight: "1px solid #333", overflow: "auto", padding: 8, color: "#ddd" }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Files</div>
-        {files.length === 0 ? (
-          <div style={{ color: "#777" }}>No files (fix errors or type something)</div>
-        ) : (
-          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-            {files.map(f => (
-              <li key={f.path} style={{ margin: "2px 0" }}>
-                <button
-                  onClick={() => setSelectedPath(f.path)}
-                  style={{
-                    width: "100%",
-                    textAlign: "left",
-                    background: selectedPath === f.path ? "#1e1e1e" : "transparent",
-                    border: "1px solid #333",
-                    borderRadius: 6,
-                    padding: "6px 8px",
-                    color: "#ddd",
-                    cursor: "pointer"
-                  }}
-                >
-                  {f.path}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+    <div
+  style={{
+    display: "grid",
+    gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr)`,
+    gridTemplateRows: `1fr 6px ${bottomHeight}px`,
+    height: "100vh",
+    background: "#111",
+    overflow: "hidden",
+  }}
+>
+  {/* File tree (left) */}
+  <div
+    style={{
+      gridColumn: "1 / 2",
+      gridRow: "1 / 4",
+      borderRight: "1px solid #333",
+      overflow: "auto",
+      padding: 8,
+      color: "#ddd",
+    }}
+  >
+    <div style={{ fontWeight: 700, marginBottom: 8 }}>Files</div>
+    {files.length === 0 ? (
+      <div style={{ color: "#777" }}>No files (fix errors or type something)</div>
+    ) : (
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {files.map((f) => (
+          <li key={f.path} style={{ margin: "2px 0" }}>
+            <button
+              onClick={() => setSelectedPath(f.path)}
+              style={{
+                width: "100%",
+                textAlign: "left",
+                background: selectedPath === f.path ? "#1e1e1e" : "transparent",
+                border: "1px solid #333",
+                borderRadius: 6,
+                padding: "6px 8px",
+                color: "#ddd",
+                cursor: "pointer",
+              }}
+            >
+              {f.path}
+            </button>
+          </li>
+        ))}
+      </ul>
+    )}
+  </div>
 
-      {/* Editor + Preview */}
-      <div style={{ gridColumn: "2 / 3", gridRow: "1 / 2", display: "grid", gridTemplateRows: "1fr 40%", gap: 8, padding: 8 }}>
-        <div style={{ border: "1px solid #333" }}>
-          <Editor
-            height="100%"
-            defaultLanguage="plaintext"
-            theme="vs-dark"
-            value={code}
-            onChange={(v) => setCode(v ?? "")}
-            onMount={onMount}
-            options={{
-              fontSize: 14,
-              minimap: { enabled: false },
-              scrollBeyondLastLine: false,
-              wordWrap: "on",
-            }}
-          />
-        </div>
+  {/* Vertical splitter */}
+  <div
+    onMouseDown={startDragVert}
+    style={{
+      gridColumn: "2 / 3",
+      gridRow: "1 / 4",
+      cursor: "col-resize",
+      background: "#181818",
+    }}
+  />
 
-        {/* Preview of selected file */}
-        <div style={{ border: "1px solid #333", overflow: "auto", background: "#0b0b0b" }}>
-          <div style={{ padding: "6px 8px", borderBottom: "1px solid #222", color: "#bbb", display: "flex", justifyContent: "space-between" }}>
-            <div>Preview: <code>{selectedFile?.path || "(none)"}</code></div>
-            <div>{files.length} files</div>
-          </div>
-          <pre style={{ margin: 0, padding: 12, whiteSpace: "pre-wrap", color: "#ddd" }}>{selectedFile?.contents ?? ""}</pre>
-        </div>
-      </div>
+  {/* Editor + Preview (top-right) */}
+  <div
+    id="editorPane"
+    style={{
+      gridColumn: "3 / 4",
+      gridRow: "1 / 2",
+      display: "grid",
+      gridTemplateRows: `${editorHeight}px 6px 1fr`, // editor | splitter | preview
+      gap: 0,
+      padding: 8,
+      minWidth: 0,
+      minHeight: 0,
+    }}
+  >
+    {/* Editor */}
+    <div style={{ border: "1px solid #333", minHeight: 0 }}>
+      <Editor
+        height="100%"
+        defaultLanguage="datapack-lang"
+        theme="vs-dark"
+        value={code}
+        onChange={(v) => setCode(v ?? "")}
+        onMount={onMount}
+        options={{
+  fontSize: 14,
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  wordWrap: "on",
+  quickSuggestions: { other: true, comments: false, strings: true },
+  suggestOnTriggerCharacters: true,
+  tabCompletion: "on",
+  snippetSuggestions: "inline",
+  autoClosingBrackets: "languageDefined",
+  autoClosingQuotes: "languageDefined",
+  autoSurround: "languageDefined",
+  autoIndent: "advanced",
+}}
 
-      {/* Problems panel */}
-      <div style={{ gridColumn: "2 / 3", gridRow: "2 / 3", borderTop: "1px solid #333", background: "#141414", color: "#ddd", overflow: "auto" }}>
-        <div style={{ padding: "6px 8px", borderBottom: "1px solid #222", display: "flex", justifyContent: "space-between" }}>
-          <div>Problems</div>
-          <div>{problems.length}</div>
-        </div>
-        {problems.length === 0 ? (
-          <div style={{ padding: 8, color: "#7aa06a" }}>No problems</div>
-        ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-            <thead>
-              <tr style={{ background: "#1c1c1c" }}>
-                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Severity</th>
-                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Message</th>
-                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Line</th>
-                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #333" }}>Col</th>
-              </tr>
-            </thead>
-            <tbody>
-              {problems.map((p, i) => (
-                <tr key={i} style={{ borderBottom: "1px solid #222" }}>
-                  <td style={{ padding: 6, color: p.severity === "Error" ? "#ff6b6b" : p.severity === "Warning" ? "#ffd56b" : "#7aa0ff" }}>{p.severity}</td>
-                  <td style={{ padding: 6 }}>{p.message}</td>
-                  <td style={{ padding: 6 }}>{p.line ?? 0}</td>
-                  <td style={{ padding: 6 }}>{p.col ?? 0}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+      />
+
+      
     </div>
-  );
+
+    {/* Editor/Preview splitter (row 2) */}
+    <div
+      onMouseDown={startDragEditor}
+      style={{ height: 6, cursor: "row-resize", background: "#181818" }}
+    />
+
+    {/* Preview of selected file (row 3) */}
+    <div
+      style={{
+        border: "1px solid #333",
+        overflow: "auto",
+        background: "#0b0b0b",
+        minHeight: 0,
+      }}
+    >
+      <div
+        style={{
+          padding: "6px 8px",
+          borderBottom: "1px solid #222",
+          color: "#bbb",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <div>
+          Preview: <code>{selectedFile?.path || "(none)"}</code>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div>{files.length} files</div>
+          <button
+            onClick={() => downloadDatapackZip(files)}
+            style={{
+              background: "#1e1e1e",
+              border: "1px solid #444",
+              borderRadius: 6,
+              color: "#ddd",
+              padding: "6px 10px",
+              cursor: "pointer",
+            }}
+            disabled={!files.length}
+            title={files.length ? "Download datapack.zip" : "No files to download"}
+          >
+            Download .zip
+          </button>
+        </div>
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          padding: 12,
+          whiteSpace: "pre-wrap",
+          color: "#ddd",
+        }}
+      >
+        {selectedFile?.contents ?? ""}
+      </pre>
+    </div>
+  </div>
+
+  {/* Horizontal splitter */}
+  <div
+    onMouseDown={startDragHoriz}
+    style={{
+      gridColumn: "3 / 4",
+      gridRow: "2 / 3",
+      cursor: "row-resize",
+      background: "#181818",
+    }}
+  />
+
+  {/* Problems panel (bottom-right) */}
+  <div
+    style={{
+      gridColumn: "3 / 4",
+      gridRow: "3 / 4",
+      borderTop: "1px solid #333",
+      background: "#141414",
+      color: "#ddd",
+      overflow: "auto",
+      minHeight: 0,
+    }}
+  >
+    <div
+      style={{
+        padding: "6px 8px",
+        borderBottom: "1px solid #222",
+        display: "flex",
+        justifyContent: "space-between",
+      }}
+    >
+      <div>Problems</div>
+      <div>{problems.length}</div>
+    </div>
+    {problems.length === 0 ? (
+      <div style={{ padding: 8, color: "#7aa06a" }}>No problems</div>
+    ) : (
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          fontSize: 13,
+        }}
+      >
+        <thead>
+          <tr style={{ background: "#1c1c1c" }}>
+            <th
+              style={{
+                textAlign: "left",
+                padding: 6,
+                borderBottom: "1px solid #333",
+              }}
+            >
+              Severity
+            </th>
+            <th
+              style={{
+                textAlign: "left",
+                padding: 6,
+                borderBottom: "1px solid #333",
+              }}
+            >
+              Message
+            </th>
+            <th
+              style={{
+                textAlign: "left",
+                padding: 6,
+                borderBottom: "1px solid #333",
+              }}
+            >
+              Line
+            </th>
+            <th
+              style={{
+                textAlign: "left",
+                padding: 6,
+                borderBottom: "1px solid #333",
+              }}
+            >
+              Col
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {problems.map((p, i) => (
+            <tr key={i} style={{ borderBottom: "1px solid #222" }}>
+              <td
+                style={{
+                  padding: 6,
+                  color:
+                    p.severity === "Error"
+                      ? "#ff6b6b"
+                      : p.severity === "Warning"
+                      ? "#ffd56b"
+                      : "#7aa0ff",
+                }}
+              >
+                {p.severity}
+              </td>
+              <td style={{ padding: 6 }}>{p.message}</td>
+              <td style={{ padding: 6 }}>{p.line ?? 0}</td>
+              <td style={{ padding: 6 }}>{p.col ?? 0}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </div>
+</div>
+
+ );
 }
