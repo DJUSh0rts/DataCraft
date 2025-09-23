@@ -996,25 +996,25 @@ function componentTokensToMap(ts?: Token[]): Record<string, any> | undefined {
   return out;
 }
 
-function tokensToText(ts: Token[]): string {
-  let out = "";
-  for (const t of ts) {
-    switch (t.type) {
-      case "String": out += JSON.stringify(t.value ?? ""); break;
-      case "Identifier":
-      case "Number": out += t.value ?? ""; break;
-      case "Comma": out += ", "; break;
-      case "Colon": out += ":"; break;
-      case "Equals": out += "="; break;
-      case "LBrace": out += "{"; break;
-      case "RBrace": out += "}"; break;
-      case "LBracket": out += "["; break;
-      case "RBracket": out += "]"; break;
-      default: out += t.value ?? ""; break;
-    }
-  }
-  return out;
-}
+// function tokensToText(ts: Token[]): string {
+//   let out = "";
+//   for (const t of ts) {
+//     switch (t.type) {
+//       case "String": out += JSON.stringify(t.value ?? ""); break;
+//       case "Identifier":
+//       case "Number": out += t.value ?? ""; break;
+//       case "Comma": out += ", "; break;
+//       case "Colon": out += ":"; break;
+//       case "Equals": out += "="; break;
+//       case "LBrace": out += "{"; break;
+//       case "RBrace": out += "}"; break;
+//       case "LBracket": out += "["; break;
+//       case "RBracket": out += "]"; break;
+//       default: out += t.value ?? ""; break;
+//     }
+//   }
+//   return out;
+// }
 
 
 function renderMacroTemplate(src: string): { line: string; refs: string[] } {
