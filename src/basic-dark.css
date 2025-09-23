@@ -1,19 +1,70 @@
-/* src/basic-dark.css */
+/* Minimal dark baseline so the app looks okay even without Tailwind.
+   If you're using Tailwind (recommended for the utility classes in ui/*),
+   this file can remain very small. */
+
 :root {
-  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #151821;
+  --surface: #1b2030;
+  --text: #e5e7eb;
+  --muted: #94a3b8;
+  --border: #2a2f3d;
+  --accent: #2563eb;
+  --error: #ef4444;
+  --warn: #f59e0b;
+  --info: #60a5fa;
 }
+
+* { box-sizing: border-box; }
+
 html, body, #root {
   height: 100%;
-}
-body {
   margin: 0;
-  background: #0a0a0a;
-  color: #e5e5e5;
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji",
+    "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
 }
+
+/* Simple flex helpers (only used if Tailwind isn't present) */
+.flex { display: flex; }
+.flex-1 { flex: 1 1 0%; }
+.h-screen { height: 100vh; }
+.w-96 { width: 24rem; }
+.flex-col { flex-direction: column; }
+.border-l { border-left: 1px solid var(--border); }
+.border-t { border-top: 1px solid var(--border); }
+.border-gray-700 { border-color: var(--border); }
+.p-2 { padding: 0.5rem; }
+.m-2 { margin: 0.5rem; }
+.rounded { border-radius: 0.375rem; }
+.overflow-auto { overflow: auto; }
+.max-h-40 { max-height: 10rem; }
+.max-h-48 { max-height: 12rem; }
+
+/* Colors / backgrounds approximations for Tailwind classes used */
+.bg-blue-600 { background: #2563eb; }
+.text-white { color: #fff; }
+.text-xs { font-size: 0.75rem; line-height: 1rem; }
+.text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+.font-bold { font-weight: 700; }
+.text-gray-400 { color: #9ca3af; }
+.text-green-300 { color: #86efac; }
+.text-red-400 { color: #f87171; }
+.text-yellow-400 { color: #facc15; }
+.text-blue-400 { color: #60a5fa; }
+
+.bg-black { background: #000; }
+.bg-gray-700 { background: #374151; }
+.hover\:bg-gray-800:hover { background: #1f2937; }
+
+/* Buttons */
 button {
   cursor: pointer;
+  border: 1px solid transparent;
 }
-code, pre {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
