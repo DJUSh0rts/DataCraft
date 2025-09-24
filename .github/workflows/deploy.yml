@@ -17,22 +17,40 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Make sure devDependencies are installed (vite, typescript, etc.)
+      NODE_ENV: development
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Show repo files
+        run: |
+          echo "Top-level files:"; ls -la
+          echo "package.json:"; cat package.json || true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
-      - name: Print Node & NPM versions
-        run: |
-          node -v | tee node-version.txt
-          npm -v  | tee npm-version.txt
+      - name: Enable Corepack (for pnpm/yarn if present)
+        run: corepack enable
 
-      - name: Install deps (capture log)
-        id: install
-        continue-on-error: true
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> $GITHUB_OUTPUT
+          elif [ -f yarn.lock ]; then
+            echo "manager=yarn" >> $GITHUB_OUTPUT
+          else
+            echo "manager=npm" >> $GITHUB_OUTPUT
+          fi
+          echo "Detected PM: $(cat $GITHUB_OUTPUT)"
+
+      - name: Install dependencies (npm)
+        if: steps.pm.outputs.manager == 'npm'
         run: |
           set -o pipefail
           if [ -f package-lock.json ]; then
@@ -41,16 +59,50 @@ jobs:
             npm install 2>&1 | tee install.log
           fi
 
-      - name: Verify vite presence
-        run: npx --yes vite --version || true
+      - name: Install dependencies (pnpm)
+        if: steps.pm.outputs.manager == 'pnpm'
+        run: |
+          corepack prepare pnpm@latest --activate
+          pnpm i --frozen-lockfile 2>&1 | tee install.log
 
-      - name: Build (capture log)
-        id: buildstep
-        continue-on-error: true
+      - name: Install dependencies (yarn)
+        if: steps.pm.outputs.manager == 'yarn'
+        run: |
+          corepack prepare yarn@stable --activate
+          yarn install --frozen-lockfile 2>&1 | tee install.log
+
+      - name: Print versions
+        run: |
+          node -v | tee node-version.txt
+          npm -v  | tee npm-version.txt || true
+          npx vite --version || true
+
+      - name: Build (npm)
+        if: steps.pm.outputs.manager == 'npm'
         run: |
           set -o pipefail
           if npm run | grep -q " build"; then
             npm run build 2>&1 | tee build.log
+          else
+            npx --yes vite build 2>&1 | tee build.log
+          fi
+
+      - name: Build (pnpm)
+        if: steps.pm.outputs.manager == 'pnpm'
+        run: |
+          set -o pipefail
+          if pnpm -w run | grep -q " build"; then
+            pnpm run build 2>&1 | tee build.log
+          else
+            npx --yes vite build 2>&1 | tee build.log
+          fi
+
+      - name: Build (yarn)
+        if: steps.pm.outputs.manager == 'yarn'
+        run: |
+          set -o pipefail
+          if yarn run | grep -q " build"; then
+            yarn build 2>&1 | tee build.log
           else
             npx --yes vite build 2>&1 | tee build.log
           fi
@@ -73,23 +125,14 @@ jobs:
             node-version.txt
             npm-version.txt
 
-      - name: Fail if install failed
-        if: steps.install.outcome == 'failure'
-        run: |
-          echo "Install failed — see install.log in artifacts."
-          exit 1
-
       - name: Setup Pages
-        if: steps.buildstep.outcome == 'success'
         uses: actions/configure-pages@v5
 
       - name: Copy SPA 404
-        if: steps.buildstep.outcome == 'success'
         run: |
           if [ -f dist/index.html ]; then cp dist/index.html dist/404.html; fi
 
       - name: Upload artifact
-        if: steps.buildstep.outcome == 'success'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
