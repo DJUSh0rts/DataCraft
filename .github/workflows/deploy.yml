@@ -25,14 +25,28 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Install deps
+      - name: Print Node & NPM versions
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          node -v | tee node-version.txt
+          npm -v  | tee npm-version.txt
+
+      - name: Install deps (capture log)
+        id: install
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if [ -f package-lock.json ]; then
+            npm ci 2>&1 | tee install.log
+          else
+            npm install 2>&1 | tee install.log
+          fi
 
       - name: Verify vite presence
         run: npx --yes vite --version || true
 
       - name: Build (capture log)
+        id: buildstep
+        continue-on-error: true
         run: |
           set -o pipefail
           if npm run | grep -q " build"; then
@@ -41,32 +55,41 @@ jobs:
             npx --yes vite build 2>&1 | tee build.log
           fi
 
-      - name: Show last 200 lines of build.log
+      - name: Show logs (tail)
         if: always()
         run: |
-          echo "========== build.log (tail) =========="
-          tail -n 200 build.log || true
-          echo "======================================"
-
-      - name: Copy SPA 404
-        if: success()
-        run: |
-          if [ -f dist/index.html ]; then cp dist/index.html dist/404.html; fi
+          echo "===== install.log (tail) ====="; tail -n 200 install.log || true
+          echo "===== build.log (tail)   ====="; tail -n 200 build.log   || true
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
+          if-no-files-found: ignore
           path: |
+            install.log
             build.log
+            node-version.txt
+            npm-version.txt
+
+      - name: Fail if install failed
+        if: steps.install.outcome == 'failure'
+        run: |
+          echo "Install failed — see install.log in artifacts."
+          exit 1
 
       - name: Setup Pages
-        if: success()
+        if: steps.buildstep.outcome == 'success'
         uses: actions/configure-pages@v5
 
+      - name: Copy SPA 404
+        if: steps.buildstep.outcome == 'success'
+        run: |
+          if [ -f dist/index.html ]; then cp dist/index.html dist/404.html; fi
+
       - name: Upload artifact
-        if: success()
+        if: steps.buildstep.outcome == 'success'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
