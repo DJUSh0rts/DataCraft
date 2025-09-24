@@ -24,8 +24,17 @@ jobs:
           cache: 'npm'
       - name: Setup Pages
         uses: actions/configure-pages@v5
+
+      - name: Print env
+        run: |
+          node -v
+          npm -v
+      - name: Show scripts
+        run: node -e "console.log(require('./package.json').scripts)"
+
       - run: npm ci
-      - run: npm run build
+      - name: Build
+        run: npm run build
       - name: SPA fallback
         run: cp dist/index.html dist/404.html
       - uses: actions/upload-pages-artifact@v3
