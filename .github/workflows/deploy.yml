@@ -25,58 +25,48 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Print environment
+      - name: Install deps
         run: |
-          node -v
-          npm -v
-          ls -la
-          cat package.json || true
-
-      - name: Install deps (lockfile-aware)
-        run: |
-          if [ -f package-lock.json ]; then
-            echo "Using npm ci"
-            npm ci 2>&1 | tee npm-install.log
-          else
-            echo "No package-lock.json found; using npm install"
-            npm install 2>&1 | tee npm-install.log
-          fi
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
       - name: Verify vite presence
-        run: |
-          npx --yes vite --version || true
-          ls -la node_modules/.bin || true
+        run: npx --yes vite --version || true
 
-      - name: Build (script if present, else fallback to vite)
+      - name: Build (capture log)
         run: |
           set -o pipefail
           if npm run | grep -q " build"; then
-            echo "Running npm run build"
             npm run build 2>&1 | tee build.log
           else
-            echo "No build script. Fallback to npx vite build"
             npx --yes vite build 2>&1 | tee build.log
           fi
 
-      - name: SPA 404 fallback
+      - name: Show last 200 lines of build.log
+        if: always()
         run: |
-          if [ -f dist/index.html ]; then
-            cp dist/index.html dist/404.html
-          fi
+          echo "========== build.log (tail) =========="
+          tail -n 200 build.log || true
+          echo "======================================"
 
-      - name: Upload logs (always)
+      - name: Copy SPA 404
+        if: success()
+        run: |
+          if [ -f dist/index.html ]; then cp dist/index.html dist/404.html; fi
+
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
-            npm-install.log
             build.log
 
       - name: Setup Pages
+        if: success()
         uses: actions/configure-pages@v5
 
       - name: Upload artifact
+        if: success()
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
