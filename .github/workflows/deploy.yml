@@ -30,6 +30,7 @@ jobs:
           node -v
           npm -v
           ls -la
+          cat package.json || true
 
       - name: Install deps (lockfile-aware)
         run: |
@@ -41,13 +42,27 @@ jobs:
             npm install 2>&1 | tee npm-install.log
           fi
 
-      - name: Build
+      - name: Verify vite presence
+        run: |
+          npx --yes vite --version || true
+          ls -la node_modules/.bin || true
+
+      - name: Build (script if present, else fallback to vite)
         run: |
           set -o pipefail
-          npm run build 2>&1 | tee build.log
+          if npm run | grep -q " build"; then
+            echo "Running npm run build"
+            npm run build 2>&1 | tee build.log
+          else
+            echo "No build script. Fallback to npx vite build"
+            npx --yes vite build 2>&1 | tee build.log
+          fi
 
-      - name: SPA fallback
-        run: cp dist/index.html dist/404.html
+      - name: SPA 404 fallback
+        run: |
+          if [ -f dist/index.html ]; then
+            cp dist/index.html dist/404.html
+          fi
 
       - name: Upload logs (always)
         if: always()
