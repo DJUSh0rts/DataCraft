@@ -1,3 +1,19 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [ main, master ]   # keep both if you're unsure which is default
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -6,9 +22,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
+          cache: npm
 
       - name: Show Node & scripts
         run: |
@@ -18,9 +32,6 @@ jobs:
 
       - name: Install
         run: npm ci
-
-      - name: List installed deps (debug)
-        run: npm ls --depth=0 || true
 
       - name: Build (capture log)
         run: |
@@ -34,9 +45,20 @@ jobs:
           name: build-log
           path: build.log
 
+      # Single Page App fallback for GitHub Pages
       - name: SPA fallback
         run: cp dist/index.html dist/404.html
 
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
