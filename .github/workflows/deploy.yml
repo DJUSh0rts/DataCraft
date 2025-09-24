@@ -2,7 +2,7 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [ main, master ]   # keep both if you're unsure which is default
+    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
@@ -19,37 +19,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
-      - name: Show Node & scripts
+      - name: Print environment
         run: |
           node -v
           npm -v
-          node -e "console.log(require('./package.json').scripts)"
+          ls -la
 
-      - name: Install
-        run: npm ci
+      - name: Install deps (lockfile-aware)
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "Using npm ci"
+            npm ci 2>&1 | tee npm-install.log
+          else
+            echo "No package-lock.json found; using npm install"
+            npm install 2>&1 | tee npm-install.log
+          fi
 
-      - name: Build (capture log)
+      - name: Build
         run: |
           set -o pipefail
           npm run build 2>&1 | tee build.log
 
-      - name: Upload build log (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-
-      # Single Page App fallback for GitHub Pages
       - name: SPA fallback
         run: cp dist/index.html dist/404.html
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            npm-install.log
+            build.log
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
 
