@@ -111,3 +111,7 @@ export function lex(input: string): Token[] {
   push({ type: "EOF", line, col });
   return tokens;
 }
+
+
+// (optional) re-export types so other files can import from 'lexer' if they want
+export type { Token, TokenType };

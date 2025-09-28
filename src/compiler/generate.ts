@@ -809,6 +809,8 @@ if (b === "Ent") {
       }
     }
 
+    
+
     function emitFor(stmt: any, chain: string, envTypes: Record<string, VarKind>, outArr: string[]) {
       const withChainParent = withChainTo(outArr);
       const loopId = forCounter++;
@@ -866,10 +868,62 @@ if (b === "Ent") {
       withChainParent(chain, `function ${p.namespace}:${entryName}`);
     }
 
+    // --- While loops ---
+function emitWhile(
+  stmt: { kind: "While"; cond: Condition | null; body: Stmt[]; line: number; col: number },
+  chain: string,
+  envTypes: Record<string, VarKind>,
+  outArr: string[]
+) {
+  const withChainParent = withChainTo(outArr);
+
+  // unique ids for this while
+  const loopId = forCounter++; // re-use the same counter you use for for-loops
+  const entryName = `__while_${loopId}`;
+  const stepName  = `__while_${loopId}__step`;
+
+  // Build the entry function: check condition -> run step -> recurse
+  const entryLines: string[] = [];
+  const tmpStateEntry = { n: 0 };
+
+  // Turn the while condition into execute-guard variants
+  // (this can emit numeric-eval setup lines into entryLines)
+  const variants = condToVariants(stmt.cond ?? null, chain, null, envTypes, entryLines, tmpStateEntry, false);
+  if (variants.length === 0) variants.push([]);
+
+  for (const parts of variants) {
+    // If condition true, run step
+    if (parts.length) {
+      // was:
+// entryLines.push(tokensToPref(chain)(`execute ${parts.join(" ")} run function ${p.namespace}:${stepName}`));
+// now:
+entryLines.push(`execute ${parts.join(" ")} run function ${p.namespace}:${stepName}`);
+
+    } else {
+      entryLines.push(`function ${p.namespace}:${stepName}`);
+    }
+  }
+
+  // Step function: run body, then jump back to entry (re-check condition)
+  const stepLines: string[] = [];
+  for (const s of stmt.body) emitStmt(s, chain, null, envTypes, stepLines);
+  stepLines.push(`function ${p.namespace}:${entryName}`);
+
+  // Emit the two helper files
+  files.push({ path: `data/${p.namespace}/function/${entryName}.mcfunction`, contents: entryLines.join("\n") + "\n" });
+  files.push({ path: `data/${p.namespace}/function/${stepName}.mcfunction`, contents: stepLines.join("\n") + "\n" });
+
+  // Kick off the loop
+  withChainParent(chain, `function ${p.namespace}:${entryName}`);
+}
+
+
     // Dispatcher
     function emitStmt(st: Stmt, chain: string, localScores: Record<string, string> | null, envTypes: Record<string, VarKind>, outArr: string[]) {
       const withChain = withChainTo(outArr);
       switch (st.kind) {
+        case "While":
+          return emitWhile(st as any, chain, envTypes, outArr);
         case "VarDecl": {
           const b = baseOf(st.varType);
           const isLocal = !st.isGlobal;

@@ -1,8 +1,265 @@
-html, body, #root {
-  height: 100%;
+/* ================================
+   DataCraft — Dark UI Theme
+   ================================ */
+
+/* ---- CSS Vars ---- */
+:root {
+  --bg: #0b0d10;
+  --bg-elev-1: #111418;
+  --bg-elev-2: #151a20;
+  --bg-elev-3: #1a2129;
+
+  --text: #dfe6ee;
+  --text-dim: #a5b0bc;
+  --muted: #6f7a87;
+
+  --accent: #7aa2ff;
+  --accent-2: #9c7aff;
+
+  --ok: #53d397;
+  --warn: #ffd166;
+  --err: #ff6b6b;
+  --info: #68d1ff;
+
+  --border: #263041;
+  --border-strong: #2f3b4f;
+
+  --shadow: 0 8px 24px rgba(0,0,0,.35);
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-lg: 18px;
+
+  --gap: 12px;
+
+  --btn-bg: linear-gradient(180deg, #1b222c, #151b23);
+  --btn-hover: linear-gradient(180deg, #222a36, #19202a);
+  --btn-active: linear-gradient(180deg, #18202a, #131922);
+}
+
+/* ---- Base ---- */
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
   margin: 0;
-  padding: 0;
-  background: #111;
-  color: #ddd;
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+  background: radial-gradient(1200px 600px at 15% -10%, rgba(124,149,255,.08), transparent) no-repeat,
+              radial-gradient(1000px 500px at 100% 0%, rgba(156,122,255,.06), transparent) no-repeat,
+              var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---- Layout ---- */
+.app {
+  display: grid;
+  grid-template-columns: 1fr 420px;
+  gap: var(--gap);
+  height: 100%;
+  padding: var(--gap);
+}
+
+/* Panels */
+.panel {
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* Header / Toolbar area (optional container) */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--bg-elev-2), var(--bg-elev-1));
+}
+
+/* ---- Buttons ---- */
+button,
+.button {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--btn-bg);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 600;
+  letter-spacing: .2px;
+  transition: transform .06s ease, box-shadow .2s ease, border-color .2s ease, background .2s ease;
+  box-shadow: 0 0 0 rgba(0,0,0,0);
+}
+button:hover, .button:hover {
+  background: var(--btn-hover);
+  border-color: var(--border-strong);
+  box-shadow: 0 6px 16px rgba(0,0,0,.25);
+}
+button:active, .button:active {
+  background: var(--btn-active);
+  transform: translateY(1px);
+}
+
+/* Button variants */
+.button--primary {
+  background: linear-gradient(180deg, #27324a, #1c2536);
+  border-color: #324260;
+}
+.button--primary:hover { border-color: #3b4f72; }
+
+.button--ghost {
+  background: transparent;
+  border-color: var(--border);
+}
+.button--danger {
+  background: linear-gradient(180deg, #3a2020, #2a1616);
+  border-color: #523434;
+  color: #ffd9d9;
+}
+.button--success {
+  background: linear-gradient(180deg, #1f3529, #182a21);
+  border-color: #2d4e3c;
+  color: #d4ffe9;
+}
+
+/* ---- Sidebar (right panel content) ---- */
+.sidebar {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+}
+
+/* Sections inside sidebar */
+.section {
+  padding: 12px 12px 4px;
+}
+.section__title {
+  margin: 0 0 8px 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .12em;
+}
+
+/* Scroll container for lists */
+.scroll {
+  overflow: auto;
+  padding: 0 12px 12px;
+}
+
+/* ---- File List ---- */
+.files {
+  display: grid;
+  gap: 8px;
+}
+.file {
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.file__path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  color: var(--text);
+  margin: 0 0 4px 0;
+  overflow-wrap: anywhere;
+}
+.file__meta {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-3);
+  color: var(--text-dim);
+}
+.pill--ok    { color: var(--ok); border-color: rgba(83,211,151,.35); }
+.pill--warn  { color: var(--warn); border-color: rgba(255,209,102,.35); }
+.pill--err   { color: var(--err); border-color: rgba(255,107,107,.35); }
+.pill--info  { color: var(--info); border-color: rgba(104,209,255,.35); }
+
+/* ---- Problems ---- */
+.problems {
+  display: grid;
+  gap: 8px;
+}
+.problem {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+}
+.problem__icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  display: inline-grid;
+  place-items: center;
+  font-weight: 800;
+  font-size: 11px;
+}
+.problem--error .problem__icon { background: #3b1f27; color: var(--err); }
+.problem--warn  .problem__icon { background: #3b3320; color: var(--warn); }
+.problem--info  .problem__icon { background: #163141; color: var(--info); }
+.problem__title {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.problem__loc {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---- Output / Previews ---- */
+pre {
+  margin: 0;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev-1);
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+
+/* ---- Inputs ---- */
+input, select, textarea {
+  background: var(--bg-elev-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  outline: none;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(122,162,255,.15);
+}
+
+/* ---- Monaco tweaks ---- */
+.monaco-editor, .overflow-guard {
+  background: var(--bg-elev-1) !important;
+}
+.monaco-editor .margin,
+.monaco-editor .monaco-editor-background {
+  background: var(--bg-elev-1) !important;
 }
