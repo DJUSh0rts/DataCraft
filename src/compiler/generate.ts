@@ -2,7 +2,7 @@
 import type {
   Diagnostic, Expr, StringExpr, BinaryExpr,
   VarDeclStmt, Stmt, IfBlock, ElseBlock, Condition, CmpCond, CmpOp,
-  TypeName, Script, GeneratedFile, SymbolIndex
+  TypeName, Script, GeneratedFile, SymbolIndex, CallStmt, FuncDecl
 } from "./types";
 
 /**
@@ -361,6 +361,13 @@ export function generate(ast: Script): { files: GeneratedFile[]; diagnostics: Di
     const types: Record<string, VarKind> = {};
     for (const g of p.globals) types[g.name] = g.varType;
     packVarTypes[p.namespace] = types;
+  }
+
+  const funcSignatures: Record<string, Record<string, FuncDecl>> = {};
+  for (const p of ast.packs) {
+    const funcs: Record<string, FuncDecl> = {};
+    for (const f of p.functions) funcs[f.name] = f;
+    funcSignatures[p.namespace] = funcs;
   }
 
   // Emit each pack
@@ -1008,8 +1015,42 @@ entryLines.push(`execute ${parts.join(" ")} run function ${p.namespace}:${stepNa
         case "Say":    return emitSay((st as any).expr, chain, localScores, envTypes, outArr);
         case "Run":    return emitRun((st as any).expr, chain, localScores, envTypes, outArr);
         case "Call": {
-          const tns = (st as any).targetPack ?? p.namespace;
-          withChain(chain, `function ${tns}:${(st as any).func.toLowerCase()}`);
+          const call = st as CallStmt;
+          const targetNs = (call.targetPack ?? p.namespace).toLowerCase();
+          const funcName = call.func.toLowerCase();
+          const packFuncs = funcSignatures[targetNs];
+          const sig = packFuncs?.[funcName];
+          if (!sig && call.args.length) {
+            diagnostics.push({ severity: "Error", message: `Unknown function '${targetNs}:${funcName}' for call with arguments`, line: call.line, col: call.col });
+          } else if (sig) {
+            if (sig.params.length !== call.args.length) {
+              diagnostics.push({ severity: "Error", message: `Function '${sig.nameOriginal}' expects ${sig.params.length} argument${sig.params.length === 1 ? "" : "s"} but got ${call.args.length}`, line: call.line, col: call.col });
+            } else if (call.args.length) {
+              sig.params.forEach((param, idx) => {
+                const arg = call.args[idx];
+                const base = baseOf(param.varType);
+                if (base === "string" || base === "Ent") {
+                  if (arg.kind === "String" && !arg.value.startsWith("$")) {
+                    withChain(chain, `data modify storage ${targetNs}:variables ${param.name} set value ${JSON.stringify(arg.value)}`);
+                    return;
+                  }
+                  if (arg.kind === "Var") {
+                    const srcType = envTypes[arg.name];
+                    if (srcType && (baseOf(srcType) === "string" || baseOf(srcType) === "Ent")) {
+                      withChain(chain, `data modify storage ${targetNs}:variables ${param.name} set from storage ${p.namespace}:variables ${arg.name}`);
+                      return;
+                    }
+                  }
+                  diagnostics.push({ severity: "Error", message: `Argument ${idx + 1} for '${sig.nameOriginal}' must be a string value`, line: (arg as any).line ?? call.line, col: (arg as any).col ?? call.col });
+                  return;
+                }
+                diagnostics.push({ severity: "Error", message: `Parameter type '${param.varType}' for '${sig.nameOriginal}' is not supported for calls with arguments yet`, line: call.line, col: call.col });
+              });
+            } else if (sig.params.length > 0) {
+              diagnostics.push({ severity: "Error", message: `Function '${sig.nameOriginal}' expects ${sig.params.length} argument${sig.params.length === 1 ? "" : "s"}`, line: call.line, col: call.col });
+            }
+          }
+          withChain(chain, `function ${targetNs}:${funcName}`);
           return;
         }
         case "Execute": return emitExecute(st as any, chain, localScores, envTypes, outArr);
@@ -1023,6 +1064,13 @@ entryLines.push(`execute ${parts.join(" ")} run function ${p.namespace}:${stepNa
       const out: string[] = [];
       const localScores: Record<string, string> = {};
       const envTypes: Record<string, VarKind> = { ...packVarTypes[p.namespace] };
+      for (const param of f.params) envTypes[param.name] = param.varType;
+      for (const param of f.params) {
+        const base = baseOf(param.varType);
+        if (base === "string" || base === "Ent") {
+          out.push(`execute unless data storage ${p.namespace}:variables ${param.name} run data modify storage ${p.namespace}:variables ${param.name} set value ""`);
+        }
+      }
       for (const st of f.body) emitStmt(st, "", localScores, envTypes, out);
       upsertFile(files, `data/${p.namespace}/function/${f.name}.mcfunction`, out.join("\n") + (out.length ? "\n" : ""));
     }
