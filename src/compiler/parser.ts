@@ -2,7 +2,8 @@ import type {
   Token, TokenType, Diagnostic,
   Script, PackDecl, FuncDecl, Stmt,
   VarDeclStmt, Expr, Condition, ItemDecl, RecipeDecl, AdvDecl, TagDecl,
-  TypeName, RawCond, CmpCond, CmpOp, BoolCond, ElseBlock, WhileStmt
+  TypeName, RawCond, CmpCond, CmpOp, BoolCond, ElseBlock, WhileStmt,
+  ParamDecl
 } from "./types";
 /**
  * Recursive-descent parser for the DatapackScript language.
@@ -600,6 +601,34 @@ export function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[
   }
 
   // ---------- Statement dispatcher ----------
+  const TYPE_KEYWORDS = new Set(["string","int","float","double","bool","ent"]);
+
+  function parseParam(): ParamDecl {
+    const t = peek();
+    if (t.type !== "Identifier") {
+      throw { message: "Expected parameter", line: t.line, col: t.col };
+    }
+    const lower = (t.value ?? "").toLowerCase();
+    if (TYPE_KEYWORDS.has(lower)) {
+      const varType = parseTypeName();
+      const nameTok = expect("Identifier", "parameter name");
+      return { name: nameTok.value!, varType };
+    }
+    const nameTok = expect("Identifier", "parameter");
+    return { name: nameTok.value!, varType: "string" };
+  }
+
+  function parseParamList(): ParamDecl[] {
+    const params: ParamDecl[] = [];
+    expect("LParen");
+    if (peek().type !== "RParen") {
+      params.push(parseParam());
+      while (match("Comma")) params.push(parseParam());
+    }
+    expect("RParen");
+    return params;
+  }
+
   function parseAssignOrCallOrSayRun(): Stmt | null {
     const t = expect("Identifier"); const low = (t.value ?? "").toLowerCase();
     if (low === "run") { expect("LParen"); const expr = parseExpr(); expect("RParen"); match("Semicolon"); return { kind: "Run", expr } as Stmt; }
@@ -645,12 +674,15 @@ export function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[
     }
 
     if (match("Dot")) {
-      const funcName = expect("Identifier").value!; expect("LParen"); expect("RParen"); match("Semicolon");
-      return { kind: "Call", targetPack: nameTok.value!, func: funcName, line: t.line, col: t.col } as Stmt;
+      const funcNameTok = expect("Identifier", "function name");
+      const args = parseArgList();
+      match("Semicolon");
+      return { kind: "Call", targetPack: nameTok.value!, func: funcNameTok.value!, args, line: t.line, col: t.col } as Stmt;
     } else {
-      if (!match("LParen")) { diags.push({ severity: "Error", message: `Unknown statement '${nameTok.value}'`, line: t.line, col: t.col }); return null; }
-      expect("RParen"); match("Semicolon");
-      return { kind: "Call", func: nameTok.value!, line: t.line, col: t.col } as Stmt;
+      if (peek().type !== "LParen") { diags.push({ severity: "Error", message: `Unknown statement '${nameTok.value}'`, line: t.line, col: t.col }); return null; }
+      const args = parseArgList();
+      match("Semicolon");
+      return { kind: "Call", func: nameTok.value!, args, line: t.line, col: t.col } as Stmt;
     }
   }
 
@@ -676,11 +708,12 @@ export function parse(tokens: Token[]): { ast?: Script; diagnostics: Diagnostic[
   function parseFunc(): FuncDecl {
     const kw = expect("Identifier"); if (kw.value !== "func") throw { message: `Expected 'func'`, line: kw.line, col: kw.col };
     const nameTok = expect("Identifier"); const nameOriginal = nameTok.value!; const lowered = nameOriginal.toLowerCase();
-    expect("LParen"); expect("RParen"); expect("LBrace");
+    const params = parseParamList();
+    expect("LBrace");
     const body: Stmt[] = [];
     while (peek().type !== "RBrace" && peek().type !== "EOF") { const s = parseStmt(); if (s) body.push(s); }
     expect("RBrace");
-    return { name: lowered, nameOriginal, body };
+    return { name: lowered, nameOriginal, params, body };
   }
 
   // ---------- Pack ----------

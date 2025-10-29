@@ -48,7 +48,7 @@ export type SayStmt = { kind: "Say"; expr: Expr };
 export type RunStmt = { kind: "Run"; expr: Expr };
 export type VarDeclStmt = { kind: "VarDecl"; isGlobal: boolean; varType: TypeName; name: string; init: Expr; line: number; col: number };
 export type AssignStmt = { kind: "Assign"; name: string; op: "=" | "+=" | "-=" | "*=" | "/=" | "%="; expr: Expr; line: number; col: number };
-export type CallStmt = { kind: "Call"; targetPack?: string; func: string; line: number; col: number };
+export type CallStmt = { kind: "Call"; targetPack?: string; func: string; args: Expr[]; line: number; col: number };
 export type ElseBlock = { kind: "Else"; body: Stmt[]; line: number; col: number };
 export type IfBlock = {
   kind: "If";
@@ -96,7 +96,8 @@ export type TagCategory = "blocks" | "items";
 export type TagDecl = { kind: "Tag"; category: TagCategory; name: string; replace: boolean; values: string[]; line: number; col: number };
 
 // Decls
-export type FuncDecl = { name: string; nameOriginal: string; body: Stmt[] };
+export type ParamDecl = { name: string; varType: TypeName };
+export type FuncDecl = { name: string; nameOriginal: string; params: ParamDecl[]; body: Stmt[] };
 export type PackDecl = {
   packTitle: string;
   namespace: string;
